@@ -2,14 +2,15 @@ import base64
 import json
 import os
 import re
-import webbrowser
+import secrets
 from datetime import date
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
+import anyio
 import requests
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -21,11 +22,17 @@ WP_PASS            = os.environ.get("WP_PASS", "")
 
 BLING_CLIENT_ID     = os.environ.get("BLING_CLIENT_ID", "")
 BLING_CLIENT_SECRET = os.environ.get("BLING_CLIENT_SECRET", "")
-BLING_REDIRECT_URI  = os.environ.get("BLING_REDIRECT_URI", "http://localhost:8080/callback")
 BLING_BASE_URL      = "https://www.bling.com.br/Api/v3"
 BLING_TOKEN_FILE    = Path.home() / ".bling" / "tokens.json"
 
-mcp = FastMCP("ViennaPet MCP")
+_PORT          = int(os.environ.get("PORT", 8000))
+_PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+_BASE_URL      = f"https://{_PUBLIC_DOMAIN}" if _PUBLIC_DOMAIN else f"http://localhost:{_PORT}"
+BLING_REDIRECT_URI = os.environ.get("BLING_REDIRECT_URI", f"{_BASE_URL}/bling/callback")
+
+mcp = FastMCP("ViennaPet MCP", host="0.0.0.0", port=_PORT)
+
+_bling_pending_state: dict[str, str] = {}
 
 
 # ── WooCommerce helpers ───────────────────────────────────────────────────────
@@ -375,54 +382,63 @@ def listar_redirects_wp() -> str:
     return f"**{len(items)} redirect(s):**\n" + "\n".join(linhas)
 
 
+# ── Bling OAuth Routes ────────────────────────────────────────────────────────
+
+@mcp.custom_route("/bling/auth", methods=["GET"])
+async def bling_auth_route(request: Request) -> RedirectResponse:
+    state = secrets.token_urlsafe(16)
+    _bling_pending_state[state] = "pending"
+    auth_url = (
+        f"https://www.bling.com.br/Api/v3/oauth/authorize"
+        f"?response_type=code&client_id={BLING_CLIENT_ID}"
+        f"&redirect_uri={BLING_REDIRECT_URI}&state={state}"
+    )
+    return RedirectResponse(auth_url)
+
+
+@mcp.custom_route("/bling/callback", methods=["GET"])
+async def bling_callback_route(request: Request) -> HTMLResponse:
+    code  = request.query_params.get("code")
+    state = request.query_params.get("state")
+    if not code:
+        return HTMLResponse("<h2>Erro: código de autorização não recebido.</h2>", status_code=400)
+    if state and state not in _bling_pending_state:
+        return HTMLResponse("<h2>Erro: estado inválido (possível CSRF).</h2>", status_code=400)
+    if state:
+        del _bling_pending_state[state]
+
+    def _exchange():
+        resp = requests.post(
+            f"{BLING_BASE_URL}/oauth/token",
+            headers={"Authorization": _bling_credentials_header(), "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "authorization_code", "code": code, "redirect_uri": BLING_REDIRECT_URI},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    tokens = await anyio.to_thread.run_sync(_exchange)
+    _bling_save_tokens(tokens)
+    return HTMLResponse("<h2>Bling! conectado com sucesso! Pode fechar esta aba.</h2>")
+
+
 # ── Bling Tools ───────────────────────────────────────────────────────────────
-
-_bling_auth_code: str | None = None
-
-
-class _BlingCallbackHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        global _bling_auth_code
-        parsed = urlparse(self.path)
-        if parsed.path == "/callback":
-            qs = parse_qs(parsed.query)
-            _bling_auth_code = qs.get("code", [None])[0]
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"<h2>Bling! conectado! Pode fechar esta aba.</h2>")
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, *args):
-        pass
-
 
 @mcp.tool()
 def autenticar_bling() -> str:
-    """Inicia o fluxo OAuth com o Bling! e salva os tokens localmente."""
-    global _bling_auth_code
-    _bling_auth_code = None
+    """Retorna a URL para autenticar o Bling! via OAuth. Abra a URL no browser."""
     if not BLING_CLIENT_ID or not BLING_CLIENT_SECRET:
         return "Configure as variáveis BLING_CLIENT_ID e BLING_CLIENT_SECRET antes de autenticar."
+    state = secrets.token_urlsafe(16)
+    _bling_pending_state[state] = "pending"
     auth_url = (
         f"https://www.bling.com.br/Api/v3/oauth/authorize"
-        f"?response_type=code&client_id={BLING_CLIENT_ID}&redirect_uri={BLING_REDIRECT_URI}&state=mcp"
+        f"?response_type=code&client_id={BLING_CLIENT_ID}"
+        f"&redirect_uri={BLING_REDIRECT_URI}&state={state}"
     )
-    server = HTTPServer(("localhost", 8080), _BlingCallbackHandler)
-    server.timeout = 120
-    webbrowser.open(auth_url)
-    while _bling_auth_code is None:
-        server.handle_request()
-    server.server_close()
-    resp = requests.post(
-        f"{BLING_BASE_URL}/oauth/token",
-        headers={"Authorization": _bling_credentials_header(), "Content-Type": "application/x-www-form-urlencoded"},
-        data={"grant_type": "authorization_code", "code": _bling_auth_code, "redirect_uri": BLING_REDIRECT_URI},
+    return (
+        f"Abra esta URL no browser para autenticar com o Bling!:\n\n{auth_url}\n\n"
+        f"Após autorizar, você será redirecionado para {BLING_REDIRECT_URI} automaticamente."
     )
-    resp.raise_for_status()
-    _bling_save_tokens(resp.json())
-    return "Autenticado com sucesso! Tokens salvos em ~/.bling/tokens.json"
 
 
 @mcp.tool()
@@ -537,5 +553,4 @@ def criar_pedido_venda_bling(id_contato: int, itens: list, numero_pedido_externo
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    mcp.run(transport="sse")
