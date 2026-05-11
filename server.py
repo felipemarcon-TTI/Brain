@@ -393,6 +393,11 @@ async def health_check(request: Request) -> HTMLResponse:
     return HTMLResponse("ViennaPet MCP OK", status_code=200)
 
 
+@mcp.custom_route("/version", methods=["GET"])
+async def version(request: Request) -> HTMLResponse:
+    return HTMLResponse("v3 - consultar_estoque corrigido", status_code=200)
+
+
 # ── Bling OAuth Routes ────────────────────────────────────────────────────────
 
 @mcp.custom_route("/bling/auth", methods=["GET"])
