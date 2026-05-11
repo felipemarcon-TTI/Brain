@@ -504,14 +504,21 @@ def listar_contatos_bling(nome: str = "", pagina: int = 1, limite: int = 100) ->
 @mcp.tool()
 def consultar_estoque_bling(id_produto: int) -> str:
     """Consulta o saldo de estoque de um produto no Bling! pelo seu ID."""
-    data = _bling_get(f"/estoques/{id_produto}")
-    item = data.get("data", {})
-    if not item:
+    data = _bling_get("/estoques", {"idsProdutos[]": id_produto})
+    items = data.get("data", [])
+    if not items:
         return f"Produto {id_produto} não encontrado no estoque."
+    saldo_fisico   = sum(i.get("saldoFisicoTotal",   i.get("saldoFisico",   0)) for i in items)
+    saldo_virtual  = sum(i.get("saldoVirtualTotal",  i.get("saldoVirtual",  0)) for i in items)
+    depositos = [
+        f"  - {i.get('deposito', {}).get('descricao', 'Geral')}: {i.get('saldoFisicoTotal', i.get('saldoFisico', 0))} unid."
+        for i in items
+    ]
     return (
         f"**Estoque do produto {id_produto}:**\n"
-        f"- Saldo físico: {item.get('saldoFisico', 0)}\n"
-        f"- Saldo virtual: {item.get('saldoVirtual', 0)}"
+        f"- Saldo físico total: {saldo_fisico}\n"
+        f"- Saldo virtual total: {saldo_virtual}\n"
+        f"- Por depósito:\n" + "\n".join(depositos)
     )
 
 
