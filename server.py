@@ -100,6 +100,10 @@ def _bling_save_tokens(data: dict) -> None:
 def _bling_load_tokens() -> dict | None:
     if BLING_TOKEN_FILE.exists():
         return json.loads(BLING_TOKEN_FILE.read_text())
+    access  = os.environ.get("BLING_ACCESS_TOKEN", "")
+    refresh = os.environ.get("BLING_REFRESH_TOKEN", "")
+    if refresh:
+        return {"access_token": access, "refresh_token": refresh}
     return None
 
 def _bling_refresh_token() -> str:
@@ -418,7 +422,18 @@ async def bling_callback_route(request: Request) -> HTMLResponse:
 
     tokens = await anyio.to_thread.run_sync(_exchange)
     _bling_save_tokens(tokens)
-    return HTMLResponse("<h2>Bling! conectado com sucesso! Pode fechar esta aba.</h2>")
+    refresh = tokens.get("refresh_token", "")
+    access  = tokens.get("access_token", "")
+    html = f"""<!DOCTYPE html><html><body style="font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px">
+<h2 style="color:green">Bling! conectado com sucesso!</h2>
+<p>Salve o <strong>Refresh Token</strong> abaixo como variável <code>BLING_REFRESH_TOKEN</code> no Railway
+para que o servidor se autentique automaticamente após restarts:</p>
+<textarea rows="4" style="width:100%;font-family:monospace;font-size:12px" onclick="this.select()">{refresh}</textarea>
+<p style="color:#888;font-size:13px">Access Token (expira em breve — não precisa salvar):<br>
+<code style="font-size:11px;word-break:break-all">{access}</code></p>
+<p>Pode fechar esta aba.</p>
+</body></html>"""
+    return HTMLResponse(html)
 
 
 # ── Bling Tools ───────────────────────────────────────────────────────────────
