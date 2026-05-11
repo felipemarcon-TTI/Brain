@@ -386,6 +386,13 @@ def listar_redirects_wp() -> str:
     return f"**{len(items)} redirect(s):**\n" + "\n".join(linhas)
 
 
+# ── Health check ─────────────────────────────────────────────────────────────
+
+@mcp.custom_route("/", methods=["GET"])
+async def health_check(request: Request) -> HTMLResponse:
+    return HTMLResponse("ViennaPet MCP OK", status_code=200)
+
+
 # ── Bling OAuth Routes ────────────────────────────────────────────────────────
 
 @mcp.custom_route("/bling/auth", methods=["GET"])
