@@ -1,0 +1,25 @@
+# Credenciais — NUNCA subir
+.env
+*.env
+.env.*
+!.env.example
+
+# Tokens Bling
+.bling/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
