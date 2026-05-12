@@ -395,7 +395,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v3 - consultar_estoque corrigido", status_code=200)
+    return HTMLResponse("v4 - bling tools rewritten", status_code=200)
 
 
 # ── Bling OAuth Routes ────────────────────────────────────────────────────────
