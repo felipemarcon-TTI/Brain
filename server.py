@@ -520,7 +520,6 @@ def listar_pedidos_venda_bling(pagina: int = 1, limite: int = 100, situacao: int
 @mcp.tool()
 def consultar_estoque_bling(id_produto: int) -> str:
     """Consulta o saldo de estoque de um produto pelo seu ID."""
-    return f"[DEPLOY-TEST-v5] id={id_produto} — se voce ve isso, o novo codigo esta rodando"
     items = _bling_get("/estoques", {"idsProdutos[]": id_produto}).get("data", [])
     if not items:
         return f"Produto {id_produto} não encontrado no estoque."
