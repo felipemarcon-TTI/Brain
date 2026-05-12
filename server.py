@@ -520,9 +520,10 @@ def listar_pedidos_venda_bling(pagina: int = 1, limite: int = 100, situacao: int
 @mcp.tool()
 def consultar_estoque_bling(id_produto: int) -> str:
     """Consulta o saldo de estoque de um produto pelo seu ID."""
+    url_debug = f"{BLING_BASE_URL}/estoques?idsProdutos[]={id_produto}"
     items = _bling_get("/estoques", {"idsProdutos[]": id_produto}).get("data", [])
     if not items:
-        return f"Produto {id_produto} não encontrado no estoque."
+        return f"[v4-debug] Produto {id_produto} não encontrado. URL usada: {url_debug}"
     saldo_fisico  = sum(i.get("saldoFisicoTotal",  i.get("saldoFisico",  0)) for i in items)
     saldo_virtual = sum(i.get("saldoVirtualTotal", i.get("saldoVirtual", 0)) for i in items)
     depositos = [
