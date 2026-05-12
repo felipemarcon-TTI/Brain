@@ -395,7 +395,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v4 - bling tools rewritten", status_code=200)
+    return HTMLResponse("v5 - bling rewritten from scratch", status_code=200)
 
 
 # ── Bling OAuth Routes ────────────────────────────────────────────────────────
@@ -502,7 +502,10 @@ def listar_contatos_bling(nome: str = "", pagina: int = 1, limite: int = 100) ->
 
 @mcp.tool()
 def listar_pedidos_venda_bling(pagina: int = 1, limite: int = 100, situacao: int = 0) -> str:
-    """Lista pedidos de venda do Bling!. situacao: 0=todos, 6=em aberto, 9=atendido, 12=cancelado"""
+    """
+    Lista pedidos de venda do Bling!.
+    situacao: 0=todos, 6=em aberto, 9=atendido, 12=cancelado
+    """
     params: dict = {"pagina": pagina, "limite": limite}
     if situacao:
         params["idSituacao"] = situacao
@@ -520,7 +523,17 @@ def listar_pedidos_venda_bling(pagina: int = 1, limite: int = 100, situacao: int
 @mcp.tool()
 def consultar_estoque_bling(id_produto: int) -> str:
     """Consulta o saldo de estoque de um produto pelo seu ID."""
-    items = _bling_get("/estoques", {"idsProdutos[]": id_produto}).get("data", [])
+    token = _bling_get_token()
+    # Constrói URL manualmente para preservar os colchetes literais que a API Bling exige
+    url = f"{BLING_BASE_URL}/estoques?idsProdutos[]={id_produto}"
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers)
+    if resp.status_code == 401:
+        token = _bling_refresh_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(url, headers=headers)
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
     if not items:
         return f"Produto {id_produto} não encontrado no estoque."
     saldo_fisico  = sum(i.get("saldoFisicoTotal",  i.get("saldoFisico",  0)) for i in items)
@@ -541,15 +554,24 @@ def consultar_estoque_bling(id_produto: int) -> str:
 @mcp.tool()
 def atualizar_produto_bling(id_produto: int, preco: float = 0.0, nome: str = "", codigo: str = "") -> str:
     """Atualiza preço, nome e/ou código de um produto no Bling! pelo seu ID."""
-    campos: dict = {}
-    if preco > 0: campos["preco"] = preco
-    if nome:      campos["nome"]  = nome
-    if codigo:    campos["codigo"] = codigo
-    if not campos:
+    if not preco and not nome and not codigo:
         return "Nenhum campo informado para atualizar."
-    _bling_put(f"/produtos/{id_produto}", campos)
-    partes = [f"preço=R$ {preco:.2f}" if preco > 0 else "", f"nome={nome}" if nome else "", f"código={codigo}" if codigo else ""]
-    return f"✓ Produto [{id_produto}] atualizado | {' | '.join(p for p in partes if p)}"
+    # GET atual para montar o body completo que a API exige no PUT
+    produto = _bling_get(f"/produtos/{id_produto}").get("data", {})
+    if not produto:
+        return f"Produto {id_produto} não encontrado."
+    if preco > 0:
+        produto["preco"] = preco
+    if nome:
+        produto["nome"] = nome
+    if codigo:
+        produto["codigo"] = codigo
+    _bling_put(f"/produtos/{id_produto}", produto)
+    partes = []
+    if preco > 0: partes.append(f"preço=R$ {preco:.2f}")
+    if nome:      partes.append(f"nome={nome}")
+    if codigo:    partes.append(f"código={codigo}")
+    return f"✓ Produto [{id_produto}] atualizado | {' | '.join(partes)}"
 
 
 @mcp.tool()
