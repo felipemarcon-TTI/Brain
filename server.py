@@ -395,7 +395,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v7 - debug return in consultar_estoque", status_code=200)
+    return HTMLResponse("v8 - sync fixes from bling-mcp local", status_code=200)
 
 
 # ── Bling OAuth Routes ────────────────────────────────────────────────────────
@@ -523,9 +523,8 @@ def listar_pedidos_venda_bling(pagina: int = 1, limite: int = 100, situacao: int
 @mcp.tool()
 def consultar_estoque_bling(id_produto: int) -> str:
     """Consulta o saldo de estoque de um produto pelo seu ID."""
-    return f"[DEBUG-v7] URL que seria chamada: {BLING_BASE_URL}/estoques/saldos?idsProdutos[]={id_produto}"
     token = _bling_get_token()
-    # Endpoint correto: /estoques/saldos com idsProdutos[] como query param literal
+    # Endpoint correto: /estoques/saldos — URL manual para preservar colchetes literais
     url = f"{BLING_BASE_URL}/estoques/saldos?idsProdutos[]={id_produto}"
     headers = {"Authorization": f"Bearer {token}"}
     resp = requests.get(url, headers=headers)
@@ -557,10 +556,20 @@ def atualizar_produto_bling(id_produto: int, preco: float = 0.0, nome: str = "",
     """Atualiza preço, nome e/ou código de um produto no Bling! pelo seu ID."""
     if not preco and not nome and not codigo:
         return "Nenhum campo informado para atualizar."
-    # GET atual para montar o body completo que a API exige no PUT
     produto = _bling_get(f"/produtos/{id_produto}").get("data", {})
     if not produto:
         return f"Produto {id_produto} não encontrado."
+    # Produto variável: GET simples retorna variacoes=[]. Usar endpoint específico.
+    if produto.get("formato") == "V":
+        var_data = _bling_get(f"/produtos/variacoes/{id_produto}")
+        produto_completo = var_data.get("data", {})
+        variacoes = produto_completo.get("variacoes", [])
+        if not variacoes:
+            return (
+                f"Produto [{id_produto}] é variável (formato=V) mas não possui variações "
+                f"cadastradas inline — use o ID de uma variação específica em vez do produto pai."
+            )
+        produto = produto_completo
     if preco > 0:
         produto["preco"] = preco
     if nome:
