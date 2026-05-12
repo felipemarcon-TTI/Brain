@@ -395,7 +395,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v5 - bling rewritten from scratch", status_code=200)
+    return HTMLResponse("v6 - fix consultar_estoque endpoint /estoques/saldos", status_code=200)
 
 
 # ── Bling OAuth Routes ────────────────────────────────────────────────────────
@@ -524,8 +524,8 @@ def listar_pedidos_venda_bling(pagina: int = 1, limite: int = 100, situacao: int
 def consultar_estoque_bling(id_produto: int) -> str:
     """Consulta o saldo de estoque de um produto pelo seu ID."""
     token = _bling_get_token()
-    # Constrói URL manualmente para preservar os colchetes literais que a API Bling exige
-    url = f"{BLING_BASE_URL}/estoques?idsProdutos[]={id_produto}"
+    # Endpoint correto: /estoques/saldos com idsProdutos[] como query param literal
+    url = f"{BLING_BASE_URL}/estoques/saldos?idsProdutos[]={id_produto}"
     headers = {"Authorization": f"Bearer {token}"}
     resp = requests.get(url, headers=headers)
     if resp.status_code == 401:
