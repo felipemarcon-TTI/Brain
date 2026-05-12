@@ -452,7 +452,7 @@ para que o servidor se autentique automaticamente após restarts:</p>
 
 @mcp.tool()
 def autenticar_bling() -> str:
-    """Retorna a URL para autenticar o Bling! via OAuth. Abra a URL no browser."""
+    """Inicia o fluxo OAuth com o Bling! e salva os tokens localmente."""
     if not BLING_CLIENT_ID or not BLING_CLIENT_SECRET:
         return "Configure as variáveis BLING_CLIENT_ID e BLING_CLIENT_SECRET antes de autenticar."
     state = secrets.token_urlsafe(16)
@@ -471,59 +471,63 @@ def autenticar_bling() -> str:
 @mcp.tool()
 def listar_produtos_bling(nome: str = "", pagina: int = 1, limite: int = 100) -> str:
     """Lista produtos do Bling!. Filtra por nome se informado."""
-    params = {"pagina": pagina, "limite": limite}
+    params: dict = {"pagina": pagina, "limite": limite}
     if nome:
         params["nome"] = nome
-    data = _bling_get("/produtos", params)
-    produtos = data.get("data", [])
+    produtos = _bling_get("/produtos", params).get("data", [])
     if not produtos:
         return "Nenhum produto encontrado."
-    linhas = [f"- [{p['id']}] {p['nome']} | Código: {p.get('codigo', '-')} | Preço: R$ {p.get('preco', 0):.2f}" for p in produtos]
+    linhas = [
+        f"- [{p['id']}] {p['nome']} | Código: {p.get('codigo') or '-'} | Preço: R$ {p.get('preco', 0):.2f}"
+        for p in produtos
+    ]
     return f"**{len(produtos)} produto(s) encontrado(s):**\n" + "\n".join(linhas)
 
 
 @mcp.tool()
-def listar_pedidos_bling(pagina: int = 1, limite: int = 100, situacao: int = 0) -> str:
-    """Lista pedidos de venda do Bling!. situacao: 0=todos, 6=em aberto, 9=atendido, 12=cancelado."""
-    params = {"pagina": pagina, "limite": limite}
+def listar_contatos_bling(nome: str = "", pagina: int = 1, limite: int = 100) -> str:
+    """Lista contatos (clientes/fornecedores) do Bling!. Filtra por nome se informado."""
+    params: dict = {"pagina": pagina, "limite": limite}
+    if nome:
+        params["nome"] = nome
+    contatos = _bling_get("/contatos", params).get("data", [])
+    if not contatos:
+        return "Nenhum contato encontrado."
+    linhas = [
+        f"- [{c['id']}] {c['nome']} | {c.get('email') or '-'} | {c.get('telefone') or '-'}"
+        for c in contatos
+    ]
+    return f"**{len(contatos)} contato(s) encontrado(s):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def listar_pedidos_venda_bling(pagina: int = 1, limite: int = 100, situacao: int = 0) -> str:
+    """Lista pedidos de venda do Bling!. situacao: 0=todos, 6=em aberto, 9=atendido, 12=cancelado"""
+    params: dict = {"pagina": pagina, "limite": limite}
     if situacao:
         params["idSituacao"] = situacao
-    data = _bling_get("/pedidos/vendas", params)
-    pedidos = data.get("data", [])
+    pedidos = _bling_get("/pedidos/vendas", params).get("data", [])
     if not pedidos:
         return "Nenhum pedido encontrado."
     linhas = [
-        f"- [{p['id']}] {p.get('data', '-')} | {p.get('contato', {}).get('nome', '?')} | R$ {p.get('totalProdutos', 0):.2f} | {p.get('situacao', {}).get('nome', '-')}"
+        f"- [{p['id']}] {p.get('data', '-')} | {p.get('contato', {}).get('nome', '?')} | "
+        f"R$ {p.get('totalProdutos', 0):.2f} | {p.get('situacao', {}).get('nome', '-')}"
         for p in pedidos
     ]
     return f"**{len(pedidos)} pedido(s) encontrado(s):**\n" + "\n".join(linhas)
 
 
 @mcp.tool()
-def listar_contatos_bling(nome: str = "", pagina: int = 1, limite: int = 100) -> str:
-    """Lista contatos do Bling!. Filtra por nome se informado."""
-    params = {"pagina": pagina, "limite": limite}
-    if nome:
-        params["nome"] = nome
-    data = _bling_get("/contatos", params)
-    contatos = data.get("data", [])
-    if not contatos:
-        return "Nenhum contato encontrado."
-    linhas = [f"- [{c['id']}] {c['nome']} | {c.get('email', '-')} | {c.get('telefone', '-')}" for c in contatos]
-    return f"**{len(contatos)} contato(s) encontrado(s):**\n" + "\n".join(linhas)
-
-
-@mcp.tool()
 def consultar_estoque_bling(id_produto: int) -> str:
-    """Consulta o saldo de estoque de um produto no Bling! pelo seu ID."""
-    data = _bling_get("/estoques", {"idsProdutos[]": id_produto})
-    items = data.get("data", [])
+    """Consulta o saldo de estoque de um produto pelo seu ID."""
+    items = _bling_get("/estoques", {"idsProdutos[]": id_produto}).get("data", [])
     if not items:
         return f"Produto {id_produto} não encontrado no estoque."
-    saldo_fisico   = sum(i.get("saldoFisicoTotal",   i.get("saldoFisico",   0)) for i in items)
-    saldo_virtual  = sum(i.get("saldoVirtualTotal",  i.get("saldoVirtual",  0)) for i in items)
+    saldo_fisico  = sum(i.get("saldoFisicoTotal",  i.get("saldoFisico",  0)) for i in items)
+    saldo_virtual = sum(i.get("saldoVirtualTotal", i.get("saldoVirtual", 0)) for i in items)
     depositos = [
-        f"  - {i.get('deposito', {}).get('descricao', 'Geral')}: {i.get('saldoFisicoTotal', i.get('saldoFisico', 0))} unid."
+        f"  - {i.get('deposito', {}).get('descricao', 'Geral')}: "
+        f"{i.get('saldoFisicoTotal', i.get('saldoFisico', 0))} unid."
         for i in items
     ]
     return (
@@ -537,15 +541,15 @@ def consultar_estoque_bling(id_produto: int) -> str:
 @mcp.tool()
 def atualizar_produto_bling(id_produto: int, preco: float = 0.0, nome: str = "", codigo: str = "") -> str:
     """Atualiza preço, nome e/ou código de um produto no Bling! pelo seu ID."""
-    data = _bling_get(f"/produtos/{id_produto}")
-    produto = data.get("data", {})
-    if not produto:
-        return f"Produto {id_produto} não encontrado no Bling!."
-    if preco > 0:    produto["preco"] = preco
-    if nome:         produto["nome"] = nome
-    if codigo:       produto["codigo"] = codigo
-    _bling_put(f"/produtos/{id_produto}", produto)
-    return f"✓ Produto [{id_produto}] {produto.get('nome', '')} atualizado | Preço: R$ {produto.get('preco', 0):.2f}"
+    campos: dict = {}
+    if preco > 0: campos["preco"] = preco
+    if nome:      campos["nome"]  = nome
+    if codigo:    campos["codigo"] = codigo
+    if not campos:
+        return "Nenhum campo informado para atualizar."
+    _bling_put(f"/produtos/{id_produto}", campos)
+    partes = [f"preço=R$ {preco:.2f}" if preco > 0 else "", f"nome={nome}" if nome else "", f"código={codigo}" if codigo else ""]
+    return f"✓ Produto [{id_produto}] atualizado | {' | '.join(p for p in partes if p)}"
 
 
 @mcp.tool()
@@ -553,31 +557,31 @@ def criar_pedido_venda_bling(id_contato: int, itens: list, numero_pedido_externo
     """
     Cria um pedido de venda no Bling!.
     itens: lista de dicts com {id_produto_bling, descricao, quantidade, valor}
+    Use id_produto_bling para referenciar produtos já cadastrados no Bling.
     """
     bling_itens = []
     for item in itens:
-        i = {
+        i: dict = {
             "quantidade": item.get("quantidade", 1),
-            "valor": item.get("valor", 0),
-            "tipo": item.get("tipo", "P"),
-            "unidade": item.get("unidade", "UN"),
+            "valor":      item.get("valor", 0),
+            "tipo":       item.get("tipo", "P"),
+            "unidade":    item.get("unidade", "UN"),
         }
         if item.get("id_produto_bling"):
             i["produto"] = {"id": item["id_produto_bling"]}
         else:
             i["descricao"] = item.get("descricao", "")
         bling_itens.append(i)
-    body = {
+    body: dict = {
         "contato": {"id": id_contato},
-        "data": date.today().isoformat(),
-        "itens": bling_itens,
+        "data":    date.today().isoformat(),
+        "itens":   bling_itens,
     }
     if numero_pedido_externo:
         body["numeroPedidoCompra"] = numero_pedido_externo
     if observacoes:
         body["observacoes"] = observacoes
-    data = _bling_post("/pedidos/vendas", body)
-    pedido = data.get("data", {})
+    pedido = _bling_post("/pedidos/vendas", body).get("data", {})
     return (
         f"✓ Pedido de venda #{pedido.get('id', '?')} criado no Bling! | "
         f"Referência WooCommerce: {numero_pedido_externo or '-'}"
