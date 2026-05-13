@@ -10,7 +10,7 @@ import anyio
 import requests
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -29,6 +29,46 @@ _PORT          = int(os.environ.get("PORT", 8000))
 _PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
 _BASE_URL      = f"https://{_PUBLIC_DOMAIN}" if _PUBLIC_DOMAIN else f"http://localhost:{_PORT}"
 BLING_REDIRECT_URI = os.environ.get("BLING_REDIRECT_URI", f"{_BASE_URL}/bling/callback")
+MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+
+# ── Auth middleware ───────────────────────────────────────────────────────────
+
+_OPEN_PATHS = frozenset({"/", "/version", "/bling/callback"})
+
+class _AuthMiddleware:
+    """Exige Bearer token em todas as rotas exceto health checks e OAuth callback."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "")
+            if path not in _OPEN_PATHS:
+                headers = dict(scope.get("headers", []))
+                auth = headers.get(b"authorization", b"").decode("latin-1")
+                bearer = auth[7:] if auth.startswith("Bearer ") else ""
+
+                # /bling/auth também aceita ?token= para abrir no browser
+                if not bearer and path == "/bling/auth":
+                    import urllib.parse
+                    qs = scope.get("query_string", b"").decode()
+                    bearer = dict(urllib.parse.parse_qsl(qs)).get("token", "")
+
+                if (not MCP_AUTH_TOKEN
+                        or not bearer
+                        or not secrets.compare_digest(bearer, MCP_AUTH_TOKEN)):
+                    body = b'{"error":"Unauthorized"}'
+                    await send({
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"www-authenticate", b'Bearer realm="ViennaPet MCP"'),
+                        ],
+                    })
+                    await send({"type": "http.response.body", "body": body, "more_body": False})
+                    return
+        await self.app(scope, receive, send)
 
 mcp = FastMCP("ViennaPet MCP", host="0.0.0.0", port=_PORT)
 
@@ -623,4 +663,5 @@ def criar_pedido_venda_bling(id_contato: int, itens: list, numero_pedido_externo
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run(transport="sse")
+    import uvicorn
+    uvicorn.run(_AuthMiddleware(mcp.sse_app()), host="0.0.0.0", port=_PORT)
