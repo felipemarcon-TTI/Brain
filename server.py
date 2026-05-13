@@ -36,7 +36,7 @@ MCP_OAUTH_CLIENT_ID = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
 
 _OPEN_PATHS = frozenset({
     "/", "/version", "/bling/callback",
-    "/.well-known/oauth-authorization-server", "/oauth/token",
+    "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
 class _AuthMiddleware:
@@ -440,49 +440,102 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v11 - unified token", status_code=200)
+    return HTMLResponse("v12 - authorization code flow", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
+
+import hashlib
+import urllib.parse as _urlparse
+
+_auth_codes: dict[str, dict] = {}
+
 
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
 async def oauth_metadata(request: Request) -> JSONResponse:
     return JSONResponse({
         "issuer": _BASE_URL,
+        "authorization_endpoint": f"{_BASE_URL}/oauth/authorize",
         "token_endpoint": f"{_BASE_URL}/oauth/token",
-        "token_endpoint_auth_methods_supported": ["client_secret_post"],
-        "grant_types_supported": ["client_credentials"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
+        "grant_types_supported": ["authorization_code", "client_credentials"],
+        "code_challenge_methods_supported": ["S256", "plain"],
+        "response_types_supported": ["code"],
     })
+
+
+@mcp.custom_route("/oauth/authorize", methods=["GET"])
+async def oauth_authorize(request: Request) -> RedirectResponse:
+    client_id             = request.query_params.get("client_id", "")
+    redirect_uri          = request.query_params.get("redirect_uri", "")
+    code_challenge        = request.query_params.get("code_challenge", "")
+    code_challenge_method = request.query_params.get("code_challenge_method", "plain")
+    state                 = request.query_params.get("state", "")
+
+    if not redirect_uri:
+        return HTMLResponse("redirect_uri obrigatorio", status_code=400)
+
+    code = secrets.token_urlsafe(32)
+    _auth_codes[code] = {
+        "client_id": client_id,
+        "challenge": code_challenge,
+        "method":    code_challenge_method,
+        "redirect_uri": redirect_uri,
+    }
+    params = {"code": code}
+    if state:
+        params["state"] = state
+    return RedirectResponse(f"{redirect_uri}?{_urlparse.urlencode(params)}")
 
 
 @mcp.custom_route("/oauth/token", methods=["POST"])
 async def oauth_token(request: Request) -> JSONResponse:
+    if not MCP_AUTH_TOKEN:
+        return JSONResponse({"error": "server_error"}, status_code=500)
     try:
-        form = await request.form()
-        grant_type    = form.get("grant_type", "")
-        client_id     = form.get("client_id", "")
-        client_secret = "".join(form.get("client_secret", "").split())
+        form       = await request.form()
+        grant_type = form.get("grant_type", "")
     except Exception:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
-    if grant_type != "client_credentials":
-        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    if grant_type == "authorization_code":
+        code          = form.get("code", "")
+        code_verifier = form.get("code_verifier", "")
+        if code not in _auth_codes:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        stored = _auth_codes.pop(code)
+        method = stored.get("method", "plain")
+        if method == "S256":
+            digest    = hashlib.sha256(code_verifier.encode()).digest()
+            challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        else:
+            challenge = code_verifier
+        if stored["challenge"] and challenge != stored["challenge"]:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        return JSONResponse({
+            "access_token": MCP_AUTH_TOKEN,
+            "token_type":   "Bearer",
+            "expires_in":   86400,
+        })
 
-    if not MCP_OAUTH_CLIENT_ID or not MCP_AUTH_TOKEN:
-        return JSONResponse({"error": "server_error"}, status_code=500)
+    elif grant_type == "client_credentials":
+        client_id     = form.get("client_id", "")
+        client_secret = "".join(form.get("client_secret", "").split())
+        if not MCP_OAUTH_CLIENT_ID:
+            return JSONResponse({"error": "server_error"}, status_code=500)
+        valid = (
+            secrets.compare_digest(client_id.encode(),     MCP_OAUTH_CLIENT_ID.encode()) and
+            secrets.compare_digest(client_secret.encode(), MCP_AUTH_TOKEN.encode())
+        )
+        if not valid:
+            return JSONResponse({"error": "invalid_client"}, status_code=401)
+        return JSONResponse({
+            "access_token": MCP_AUTH_TOKEN,
+            "token_type":   "Bearer",
+            "expires_in":   86400,
+        })
 
-    valid = (
-        secrets.compare_digest(client_id.encode(),     MCP_OAUTH_CLIENT_ID.encode()) and
-        secrets.compare_digest(client_secret.encode(), MCP_AUTH_TOKEN.encode())
-    )
-    if not valid:
-        return JSONResponse({"error": "invalid_client"}, status_code=401)
-
-    return JSONResponse({
-        "access_token": MCP_AUTH_TOKEN,
-        "token_type":   "Bearer",
-        "expires_in":   86400,
-    })
+    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
 # ── Bling OAuth Routes ────────────────────────────────────────────────────────
