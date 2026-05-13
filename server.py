@@ -29,7 +29,7 @@ _PORT          = int(os.environ.get("PORT", 8000))
 _PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
 _BASE_URL      = f"https://{_PUBLIC_DOMAIN}" if _PUBLIC_DOMAIN else f"http://localhost:{_PORT}"
 BLING_REDIRECT_URI = os.environ.get("BLING_REDIRECT_URI", f"{_BASE_URL}/bling/callback")
-MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "").strip()
+MCP_AUTH_TOKEN = "".join(os.environ.get("MCP_AUTH_TOKEN", "").split())
 
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
