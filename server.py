@@ -29,7 +29,7 @@ _PORT          = int(os.environ.get("PORT", 8000))
 _PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
 _BASE_URL      = f"https://{_PUBLIC_DOMAIN}" if _PUBLIC_DOMAIN else f"http://localhost:{_PORT}"
 BLING_REDIRECT_URI = os.environ.get("BLING_REDIRECT_URI", f"{_BASE_URL}/bling/callback")
-MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "").strip()
 
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
@@ -435,7 +435,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v8 - sync fixes from bling-mcp local", status_code=200)
+    return HTMLResponse("v9 - bearer token auth", status_code=200)
 
 
 # ── Bling OAuth Routes ────────────────────────────────────────────────────────
