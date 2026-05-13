@@ -29,11 +29,16 @@ _PORT          = int(os.environ.get("PORT", 8000))
 _PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
 _BASE_URL      = f"https://{_PUBLIC_DOMAIN}" if _PUBLIC_DOMAIN else f"http://localhost:{_PORT}"
 BLING_REDIRECT_URI = os.environ.get("BLING_REDIRECT_URI", f"{_BASE_URL}/bling/callback")
-MCP_AUTH_TOKEN = "".join(os.environ.get("MCP_AUTH_TOKEN", "").split())
+MCP_AUTH_TOKEN          = "".join(os.environ.get("MCP_AUTH_TOKEN", "").split())
+MCP_OAUTH_CLIENT_ID     = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
+MCP_OAUTH_CLIENT_SECRET = "".join(os.environ.get("MCP_OAUTH_CLIENT_SECRET", "").split())
 
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
-_OPEN_PATHS = frozenset({"/", "/version", "/bling/callback"})
+_OPEN_PATHS = frozenset({
+    "/", "/version", "/bling/callback",
+    "/.well-known/oauth-authorization-server", "/oauth/token",
+})
 
 class _AuthMiddleware:
     """Exige Bearer token em todas as rotas exceto health checks e OAuth callback."""
@@ -435,7 +440,49 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v9 - bearer token auth", status_code=200)
+    return HTMLResponse("v10 - oauth2 client credentials", status_code=200)
+
+
+# ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+async def oauth_metadata(request: Request) -> JSONResponse:
+    return JSONResponse({
+        "issuer": _BASE_URL,
+        "token_endpoint": f"{_BASE_URL}/oauth/token",
+        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        "grant_types_supported": ["client_credentials"],
+    })
+
+
+@mcp.custom_route("/oauth/token", methods=["POST"])
+async def oauth_token(request: Request) -> JSONResponse:
+    try:
+        form = await request.form()
+        grant_type    = form.get("grant_type", "")
+        client_id     = form.get("client_id", "")
+        client_secret = "".join(form.get("client_secret", "").split())
+    except Exception:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    if grant_type != "client_credentials":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    if not MCP_OAUTH_CLIENT_ID or not MCP_OAUTH_CLIENT_SECRET:
+        return JSONResponse({"error": "server_error"}, status_code=500)
+
+    valid = (
+        secrets.compare_digest(client_id.encode(),     MCP_OAUTH_CLIENT_ID.encode()) and
+        secrets.compare_digest(client_secret.encode(), MCP_OAUTH_CLIENT_SECRET.encode())
+    )
+    if not valid:
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+    return JSONResponse({
+        "access_token": MCP_AUTH_TOKEN,
+        "token_type":   "Bearer",
+        "expires_in":   86400,
+    })
 
 
 # ── Bling OAuth Routes ────────────────────────────────────────────────────────
