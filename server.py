@@ -38,6 +38,7 @@ MCP_OAUTH_CLIENT_SECRET = "".join(os.environ.get("MCP_OAUTH_CLIENT_SECRET", "").
 _OPEN_PATHS = frozenset({
     "/", "/version", "/bling/callback",
     "/.well-known/oauth-authorization-server", "/oauth/token",
+    "/debug/token",
 })
 
 class _AuthMiddleware:
@@ -436,6 +437,16 @@ def listar_redirects_wp() -> str:
 @mcp.custom_route("/", methods=["GET"])
 async def health_check(request: Request) -> HTMLResponse:
     return HTMLResponse("ViennaPet MCP OK", status_code=200)
+
+
+@mcp.custom_route("/debug/token", methods=["GET"])
+async def debug_token(request: Request) -> JSONResponse:
+    return JSONResponse({
+        "token_length": len(MCP_AUTH_TOKEN),
+        "token_prefix": MCP_AUTH_TOKEN[:4] if MCP_AUTH_TOKEN else "",
+        "has_spaces":   " " in MCP_AUTH_TOKEN,
+        "has_newlines": "\n" in MCP_AUTH_TOKEN or "\r" in MCP_AUTH_TOKEN,
+    })
 
 
 @mcp.custom_route("/version", methods=["GET"])
