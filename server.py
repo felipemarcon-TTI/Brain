@@ -29,9 +29,8 @@ _PORT          = int(os.environ.get("PORT", 8000))
 _PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
 _BASE_URL      = f"https://{_PUBLIC_DOMAIN}" if _PUBLIC_DOMAIN else f"http://localhost:{_PORT}"
 BLING_REDIRECT_URI = os.environ.get("BLING_REDIRECT_URI", f"{_BASE_URL}/bling/callback")
-MCP_AUTH_TOKEN          = "".join(os.environ.get("MCP_AUTH_TOKEN", "").split())
-MCP_OAUTH_CLIENT_ID     = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
-MCP_OAUTH_CLIENT_SECRET = "".join(os.environ.get("MCP_OAUTH_CLIENT_SECRET", "").split())
+MCP_AUTH_TOKEN      = "".join(os.environ.get("MCP_AUTH_TOKEN", "").split())
+MCP_OAUTH_CLIENT_ID = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
 
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
@@ -469,12 +468,12 @@ async def oauth_token(request: Request) -> JSONResponse:
     if grant_type != "client_credentials":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
-    if not MCP_OAUTH_CLIENT_ID or not MCP_OAUTH_CLIENT_SECRET:
+    if not MCP_OAUTH_CLIENT_ID or not MCP_AUTH_TOKEN:
         return JSONResponse({"error": "server_error"}, status_code=500)
 
     valid = (
         secrets.compare_digest(client_id.encode(),     MCP_OAUTH_CLIENT_ID.encode()) and
-        secrets.compare_digest(client_secret.encode(), MCP_OAUTH_CLIENT_SECRET.encode())
+        secrets.compare_digest(client_secret.encode(), MCP_AUTH_TOKEN.encode())
     )
     if not valid:
         return JSONResponse({"error": "invalid_client"}, status_code=401)
