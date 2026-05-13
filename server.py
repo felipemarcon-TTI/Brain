@@ -440,7 +440,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v10 - oauth2 client credentials", status_code=200)
+    return HTMLResponse("v11 - unified token", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
