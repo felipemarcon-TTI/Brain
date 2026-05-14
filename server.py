@@ -1,4 +1,5 @@
 import base64
+import contextvars
 import json
 import os
 import re
@@ -32,6 +33,35 @@ BLING_REDIRECT_URI = os.environ.get("BLING_REDIRECT_URI", f"{_BASE_URL}/bling/ca
 MCP_AUTH_TOKEN      = "".join(os.environ.get("MCP_AUTH_TOKEN", "").split())
 MCP_OAUTH_CLIENT_ID = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
 
+# ── Multi-user auth ───────────────────────────────────────────────────────────
+
+_current_user: contextvars.ContextVar[dict | None] = contextvars.ContextVar("current_user", default=None)
+
+
+def _load_users() -> tuple[dict, dict]:
+    by_token: dict[str, dict] = {}
+    by_id:    dict[str, dict] = {}
+    if MCP_AUTH_TOKEN:
+        admin = {"id": "admin", "role": "write", "token": MCP_AUTH_TOKEN}
+        by_token[MCP_AUTH_TOKEN] = admin
+        by_id["admin"] = admin
+    raw = os.environ.get("MCP_USERS", "[]")
+    try:
+        for u in json.loads(raw):
+            token = "".join(u.get("token", "").split())
+            uid   = u.get("id", "")
+            role  = u.get("role", "read")
+            if token and uid:
+                user = {"id": uid, "role": role, "token": token}
+                by_token[token] = user
+                by_id[uid]      = user
+    except Exception:
+        pass
+    return by_token, by_id
+
+
+_users_by_token, _users_by_id = _load_users()
+
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
 _OPEN_PATHS = frozenset({
@@ -58,9 +88,8 @@ class _AuthMiddleware:
                     qs = scope.get("query_string", b"").decode()
                     bearer = dict(urllib.parse.parse_qsl(qs)).get("token", "")
 
-                if (not MCP_AUTH_TOKEN
-                        or not bearer
-                        or not secrets.compare_digest(bearer, MCP_AUTH_TOKEN)):
+                user = _users_by_token.get(bearer) if bearer else None
+                if not user:
                     body = b'{"error":"Unauthorized"}'
                     await send({
                         "type": "http.response.start",
@@ -72,11 +101,20 @@ class _AuthMiddleware:
                     })
                     await send({"type": "http.response.body", "body": body, "more_body": False})
                     return
+                scope["_user"] = user
+                _current_user.set(user)
         await self.app(scope, receive, send)
 
 mcp = FastMCP("ViennaPet MCP", host="0.0.0.0", port=_PORT)
 
 _bling_pending_state: dict[str, str] = {}
+
+
+def _require_write() -> None:
+    user = _current_user.get()
+    if not user or user.get("role") != "write":
+        uid = user.get("id", "?") if user else "anon"
+        raise PermissionError(f"Usuário '{uid}' tem acesso somente leitura.")
 
 
 # ── WooCommerce helpers ───────────────────────────────────────────────────────
@@ -238,6 +276,7 @@ def buscar_produto_wc(produto_id: int) -> str:
 def atualizar_produto_wc(produto_id: int, nome: str = "", preco: str = "", estoque: int = -1,
                          descricao_curta: str = "", sku: str = "") -> str:
     """Atualiza campos de um produto WooCommerce. Deixe em branco os campos que não quer alterar."""
+    _require_write()
     dados = {}
     if nome:            dados["name"] = nome
     if preco:           dados["regular_price"] = preco
@@ -269,6 +308,7 @@ def listar_variacoes(produto_id: int) -> str:
 @mcp.tool()
 def atualizar_variacao(produto_id: int, variacao_id: int, sku: str = "", preco: str = "", estoque: int = -1) -> str:
     """Atualiza SKU, preço e/ou estoque de uma variação específica de um produto variável."""
+    _require_write()
     dados = {}
     if sku:          dados["sku"] = sku
     if preco:        dados["regular_price"] = preco
@@ -284,6 +324,7 @@ def atualizar_variacao(produto_id: int, variacao_id: int, sku: str = "", preco: 
 def criar_pedido_wc(nome: str, email: str, produto_id: int, quantidade: int = 1,
                     variacao_id: int = 0, telefone: str = "", observacao: str = "") -> str:
     """Cria um pedido no WooCommerce simulando uma compra de cliente."""
+    _require_write()
     partes = nome.strip().split(" ", 1)
     line_item = {"product_id": produto_id, "quantity": quantidade}
     if variacao_id > 0:
@@ -342,6 +383,7 @@ def buscar_pedido_wc(pedido_id: int) -> str:
 @mcp.tool()
 def atualizar_status_pedido_wc(pedido_id: int, status: str) -> str:
     """Atualiza o status de um pedido WooCommerce. Status válidos: pending, processing, on-hold, completed, cancelled, refunded."""
+    _require_write()
     p = _wc_put(f"orders/{pedido_id}", {"status": status})
     return f"✓ Pedido #{p['id']} → status: {p['status']}"
 
@@ -408,6 +450,7 @@ def listar_plugins_wp() -> str:
 @mcp.tool()
 def criar_redirect_wp(url_antiga: str, url_nova: str) -> str:
     """Cria um redirecionamento 301 via plugin Redirection."""
+    _require_write()
     _wp_post("redirection/v1/redirect", {
         "url": url_antiga,
         "action_type": "url",
@@ -440,7 +483,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v12 - authorization code flow", status_code=200)
+    return HTMLResponse("v13 - multi-user auth", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -512,8 +555,10 @@ async def oauth_token(request: Request) -> JSONResponse:
             challenge = code_verifier
         if stored["challenge"] and challenge != stored["challenge"]:
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        user = _users_by_id.get(stored.get("client_id", ""))
+        access_token = user["token"] if user else MCP_AUTH_TOKEN
         return JSONResponse({
-            "access_token": MCP_AUTH_TOKEN,
+            "access_token": access_token,
             "token_type":   "Bearer",
             "expires_in":   86400,
         })
@@ -521,16 +566,11 @@ async def oauth_token(request: Request) -> JSONResponse:
     elif grant_type == "client_credentials":
         client_id     = form.get("client_id", "")
         client_secret = "".join(form.get("client_secret", "").split())
-        if not MCP_OAUTH_CLIENT_ID:
-            return JSONResponse({"error": "server_error"}, status_code=500)
-        valid = (
-            secrets.compare_digest(client_id.encode(),     MCP_OAUTH_CLIENT_ID.encode()) and
-            secrets.compare_digest(client_secret.encode(), MCP_AUTH_TOKEN.encode())
-        )
-        if not valid:
+        user = _users_by_id.get(client_id)
+        if not user or not secrets.compare_digest(client_secret.encode(), user["token"].encode()):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
         return JSONResponse({
-            "access_token": MCP_AUTH_TOKEN,
+            "access_token": user["token"],
             "token_type":   "Bearer",
             "expires_in":   86400,
         })
@@ -593,6 +633,7 @@ para que o servidor se autentique automaticamente após restarts:</p>
 @mcp.tool()
 def autenticar_bling() -> str:
     """Inicia o fluxo OAuth com o Bling! e salva os tokens localmente."""
+    _require_write()
     if not BLING_CLIENT_ID or not BLING_CLIENT_SECRET:
         return "Configure as variáveis BLING_CLIENT_ID e BLING_CLIENT_SECRET antes de autenticar."
     state = secrets.token_urlsafe(16)
@@ -694,6 +735,7 @@ def consultar_estoque_bling(id_produto: int) -> str:
 @mcp.tool()
 def atualizar_produto_bling(id_produto: int, preco: float = 0.0, nome: str = "", codigo: str = "") -> str:
     """Atualiza preço, nome e/ou código de um produto no Bling! pelo seu ID."""
+    _require_write()
     if not preco and not nome and not codigo:
         return "Nenhum campo informado para atualizar."
     produto = _bling_get(f"/produtos/{id_produto}").get("data", {})
@@ -731,6 +773,7 @@ def criar_pedido_venda_bling(id_contato: int, itens: list, numero_pedido_externo
     itens: lista de dicts com {id_produto_bling, descricao, quantidade, valor}
     Use id_produto_bling para referenciar produtos já cadastrados no Bling.
     """
+    _require_write()
     bling_itens = []
     for item in itens:
         i: dict = {
@@ -758,6 +801,66 @@ def criar_pedido_venda_bling(id_contato: int, itens: list, numero_pedido_externo
         f"✓ Pedido de venda #{pedido.get('id', '?')} criado no Bling! | "
         f"Referência WooCommerce: {numero_pedido_externo or '-'}"
     )
+
+
+# ── Admin API ─────────────────────────────────────────────────────────────────
+
+@mcp.custom_route("/admin/users", methods=["GET", "POST"])
+async def admin_users(request: Request) -> JSONResponse:
+    caller = request.scope.get("_user", {})
+    if caller.get("role") != "write":
+        return JSONResponse({"error": "Requer permissão write"}, status_code=403)
+
+    if request.method == "GET":
+        users = [{"id": u["id"], "role": u["role"]} for u in _users_by_id.values()]
+        return JSONResponse(users)
+
+    # POST — create user
+    try:
+        body = await request.json()
+        uid  = body.get("id", "").strip()
+        role = body.get("role", "read")
+    except Exception:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    if not uid:
+        return JSONResponse({"error": "id é obrigatório"}, status_code=400)
+    if uid in _users_by_id:
+        return JSONResponse({"error": f"Usuário '{uid}' já existe"}, status_code=409)
+    if role not in ("read", "write"):
+        role = "read"
+    token = secrets.token_urlsafe(32)
+    new_user = {"id": uid, "role": role, "token": token}
+    _users_by_token[token] = new_user
+    _users_by_id[uid]      = new_user
+    return JSONResponse({"id": uid, "token": token, "role": role}, status_code=201)
+
+
+@mcp.custom_route("/admin/users/{user_id}", methods=["DELETE"])
+async def admin_delete_user(request: Request) -> JSONResponse:
+    caller = request.scope.get("_user", {})
+    if caller.get("role") != "write":
+        return JSONResponse({"error": "Requer permissão write"}, status_code=403)
+    uid = request.path_params.get("user_id", "")
+    if uid == "admin":
+        return JSONResponse({"error": "Não é possível deletar o admin"}, status_code=400)
+    target = _users_by_id.pop(uid, None)
+    if not target:
+        return JSONResponse({"error": f"Usuário '{uid}' não encontrado"}, status_code=404)
+    _users_by_token.pop(target["token"], None)
+    return JSONResponse({"deleted": uid})
+
+
+@mcp.custom_route("/admin/export", methods=["GET"])
+async def admin_export(request: Request) -> JSONResponse:
+    caller = request.scope.get("_user", {})
+    if caller.get("role") != "write":
+        return JSONResponse({"error": "Requer permissão write"}, status_code=403)
+    users = [
+        {"id": u["id"], "token": u["token"], "role": u["role"]}
+        for u in _users_by_id.values()
+        if u["id"] != "admin"
+    ]
+    return JSONResponse(users)
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
