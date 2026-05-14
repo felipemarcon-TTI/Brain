@@ -258,6 +258,7 @@ def buscar_produto_wc(produto_id: int) -> str:
     """Retorna todos os detalhes de um produto WooCommerce pelo ID."""
     p = _wc_get(f"products/{produto_id}")
     atributos = "; ".join(f"{a['name']}: {', '.join(a['options'])}" for a in p.get("attributes", []))
+    imagens   = [img["src"] for img in p.get("images", []) if img.get("src")]
     return (
         f"**#{p['id']} — {p['name']}**\n"
         f"- Tipo: {p['type']} | Status: {p['status']}\n"
@@ -268,6 +269,7 @@ def buscar_produto_wc(produto_id: int) -> str:
         f"- Atributos: {atributos or '-'}\n"
         f"- Variações: {len(p.get('variations', []))}\n"
         f"- Descrição curta: {_limpar_html(p.get('short_description', '')) or '(vazia)'}\n"
+        f"- Imagens: {chr(10).join(imagens) if imagens else '(sem imagens)'}\n"
         f"- URL: {p.get('permalink')}"
     )
 
