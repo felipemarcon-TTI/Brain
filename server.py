@@ -180,12 +180,11 @@ def _bling_save_tokens(data: dict) -> None:
     BLING_TOKEN_FILE.write_text(json.dumps(data))
 
 def _bling_load_tokens() -> dict | None:
-    if BLING_TOKEN_FILE.exists():
-        return json.loads(BLING_TOKEN_FILE.read_text())
-    access  = os.environ.get("BLING_ACCESS_TOKEN", "")
     refresh = os.environ.get("BLING_REFRESH_TOKEN", "")
     if refresh:
-        return {"access_token": access, "refresh_token": refresh}
+        return {"access_token": os.environ.get("BLING_ACCESS_TOKEN", ""), "refresh_token": refresh}
+    if BLING_TOKEN_FILE.exists():
+        return json.loads(BLING_TOKEN_FILE.read_text())
     return None
 
 def _bling_refresh_token() -> str:
