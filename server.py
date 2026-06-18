@@ -4,6 +4,7 @@ import json
 import os
 import re
 import secrets
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -24,7 +25,9 @@ WP_PASS            = os.environ.get("WP_PASS", "")
 BLING_CLIENT_ID     = os.environ.get("BLING_CLIENT_ID", "")
 BLING_CLIENT_SECRET = os.environ.get("BLING_CLIENT_SECRET", "")
 BLING_BASE_URL      = "https://www.bling.com.br/Api/v3"
-BLING_TOKEN_FILE    = Path.home() / ".bling" / "tokens.json"
+# Caminho configurável: aponte para um volume persistente do Railway (ex.: /data/bling-tokens.json)
+# para que os tokens rotacionados sobrevivam a restarts/redeploys sem reautenticação manual.
+BLING_TOKEN_FILE    = Path(os.environ.get("BLING_TOKEN_PATH", str(Path.home() / ".bling" / "tokens.json")))
 
 _PORT          = int(os.environ.get("PORT", 8000))
 _PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
@@ -175,43 +178,85 @@ def _bling_credentials_header() -> str:
     raw = f"{BLING_CLIENT_ID}:{BLING_CLIENT_SECRET}".encode()
     return "Basic " + base64.b64encode(raw).decode()
 
+# Bling rotaciona o refresh_token a CADA refresh. A fonte de verdade é, em ordem:
+#   1. cache em memória desta instância (tokens mais recentes)
+#   2. arquivo persistido (sobrevive entre requests; entre restarts se em volume)
+#   3. env var BLING_REFRESH_TOKEN — usada APENAS como bootstrap inicial
+# A env var nunca tem prioridade sobre tokens já rotacionados, senão tentaríamos
+# reusar um refresh_token que o Bling já invalidou (causa do erro 400).
+_bling_lock = threading.Lock()
+_bling_tokens_cache: dict | None = None
+
 def _bling_save_tokens(data: dict) -> None:
-    BLING_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    BLING_TOKEN_FILE.write_text(json.dumps(data))
+    global _bling_tokens_cache
+    _bling_tokens_cache = data
+    try:
+        BLING_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        BLING_TOKEN_FILE.write_text(json.dumps(data))
+    except Exception as e:  # disco efêmero/sem permissão: o cache em memória ainda funciona
+        print(f"[bling] aviso: não foi possível persistir tokens em disco: {e}")
 
 def _bling_load_tokens() -> dict | None:
+    global _bling_tokens_cache
+    if _bling_tokens_cache:
+        return _bling_tokens_cache
+    if BLING_TOKEN_FILE.exists():
+        try:
+            _bling_tokens_cache = json.loads(BLING_TOKEN_FILE.read_text())
+            return _bling_tokens_cache
+        except Exception as e:
+            print(f"[bling] aviso: arquivo de tokens corrompido: {e}")
     refresh = os.environ.get("BLING_REFRESH_TOKEN", "")
     if refresh:
-        return {"access_token": os.environ.get("BLING_ACCESS_TOKEN", ""), "refresh_token": refresh}
-    if BLING_TOKEN_FILE.exists():
-        return json.loads(BLING_TOKEN_FILE.read_text())
+        _bling_tokens_cache = {
+            "access_token": os.environ.get("BLING_ACCESS_TOKEN", ""),
+            "refresh_token": refresh,
+        }
+        return _bling_tokens_cache
     return None
 
-def _bling_refresh_token() -> str:
-    tokens = _bling_load_tokens()
-    if not tokens:
-        raise RuntimeError("Não autenticado. Use a ferramenta `autenticar` primeiro.")
-    resp = requests.post(
-        f"{BLING_BASE_URL}/oauth/token",
-        headers={"Authorization": _bling_credentials_header(), "Content-Type": "application/x-www-form-urlencoded"},
-        data={"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]},
-    )
-    resp.raise_for_status()
-    new_tokens = resp.json()
-    _bling_save_tokens(new_tokens)
-    return new_tokens["access_token"]
+def _bling_refresh_token(stale_access: str | None = None) -> str:
+    """Renova o access_token. `stale_access` é o token que recebeu 401: se outra
+    thread já renovou (token em cache mudou), reusamos em vez de consumir o
+    refresh_token de novo (que o Bling invalidaria)."""
+    with _bling_lock:
+        tokens = _bling_load_tokens()
+        if not tokens:
+            raise RuntimeError("Não autenticado. Use a ferramenta `autenticar` primeiro.")
+        # Outra thread já renovou enquanto esperávamos o lock
+        if stale_access and tokens.get("access_token") and tokens["access_token"] != stale_access:
+            return tokens["access_token"]
+        resp = requests.post(
+            f"{BLING_BASE_URL}/oauth/token",
+            headers={"Authorization": _bling_credentials_header(), "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]},
+        )
+        if not resp.ok:
+            raise RuntimeError(
+                f"Falha ao renovar token Bling ({resp.status_code}): {resp.text.strip()}. "
+                "O refresh_token pode ter expirado — use `autenticar` novamente."
+            )
+        new_tokens = resp.json()
+        # Garantia: se o Bling não devolver um refresh_token novo, preserva o atual
+        if not new_tokens.get("refresh_token") and tokens.get("refresh_token"):
+            new_tokens["refresh_token"] = tokens["refresh_token"]
+        _bling_save_tokens(new_tokens)
+        return new_tokens["access_token"]
 
 def _bling_get_token() -> str:
     tokens = _bling_load_tokens()
     if not tokens:
         raise RuntimeError("Não autenticado. Use a ferramenta `autenticar` primeiro.")
+    # Sem access_token (bootstrap só com refresh): força um refresh imediato
+    if not tokens.get("access_token"):
+        return _bling_refresh_token()
     return tokens["access_token"]
 
 def _bling_get(path: str, params: dict | None = None) -> dict:
     token = _bling_get_token()
     resp = requests.get(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}"}, params=params or {})
     if resp.status_code == 401:
-        token = _bling_refresh_token()
+        token = _bling_refresh_token(stale_access=token)
         resp = requests.get(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}"}, params=params or {})
     resp.raise_for_status()
     return resp.json()
@@ -220,7 +265,7 @@ def _bling_put(path: str, body: dict) -> dict:
     token = _bling_get_token()
     resp = requests.put(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
     if resp.status_code == 401:
-        token = _bling_refresh_token()
+        token = _bling_refresh_token(stale_access=token)
         resp = requests.put(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
     if not resp.ok:
         raise RuntimeError(f"Bling API {resp.status_code}: {resp.text}")
@@ -230,7 +275,7 @@ def _bling_post(path: str, body: dict) -> dict:
     token = _bling_get_token()
     resp = requests.post(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
     if resp.status_code == 401:
-        token = _bling_refresh_token()
+        token = _bling_refresh_token(stale_access=token)
         resp = requests.post(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
     if not resp.ok:
         raise RuntimeError(f"Bling API {resp.status_code}: {resp.text}")
