@@ -187,6 +187,48 @@ def _bling_credentials_header() -> str:
 _bling_lock = threading.Lock()
 _bling_tokens_cache: dict | None = None
 
+def _persist_refresh_token_to_railway(refresh_token: str) -> bool:
+    """Persiste o refresh_token rotacionado na env var BLING_REFRESH_TOKEN do próprio
+    serviço Railway (via API GraphQL). Como o disco do Railway é efêmero, isso garante
+    que, após um restart/redeploy, o container faça bootstrap com o token mais recente —
+    sem reautenticação manual e sem volume. variableUpsert NÃO dispara redeploy: o valor
+    novo só é lido no próximo start, então não há loop de restart.
+
+    Usa RAILWAY_* deste serviço (ViennaPet) — isolado do ExpansaoPet."""
+    api_token      = os.environ.get("RAILWAY_API_TOKEN", "")
+    project_id     = os.environ.get("RAILWAY_PROJECT_ID", "")
+    environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+    service_id     = os.environ.get("RAILWAY_SERVICE_ID", "")
+    missing = [k for k, v in {
+        "RAILWAY_API_TOKEN": api_token, "RAILWAY_PROJECT_ID": project_id,
+        "RAILWAY_ENVIRONMENT_ID": environment_id, "RAILWAY_SERVICE_ID": service_id,
+    }.items() if not v]
+    if missing or not refresh_token:
+        print(f"[railway] persist ignorado - faltam vars: {missing}")
+        return False
+    query = "mutation variableUpsert($input: VariableUpsertInput!) { variableUpsert(input: $input) }"
+    variables = {"input": {
+        "projectId": project_id, "environmentId": environment_id, "serviceId": service_id,
+        "name": "BLING_REFRESH_TOKEN", "value": refresh_token,
+    }}
+    try:
+        resp = requests.post(
+            "https://backboard.railway.app/graphql/v2",
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+            json={"query": query, "variables": variables},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("errors"):
+            print(f"[railway] variableUpsert errors: {body['errors']}")
+            return False
+        print("[railway] variableUpsert OK - BLING_REFRESH_TOKEN atualizado")
+        return True
+    except Exception as e:
+        print(f"[railway] variableUpsert exception: {e}")
+        return False
+
 def _bling_save_tokens(data: dict) -> None:
     global _bling_tokens_cache
     _bling_tokens_cache = data
@@ -195,6 +237,8 @@ def _bling_save_tokens(data: dict) -> None:
         BLING_TOKEN_FILE.write_text(json.dumps(data))
     except Exception as e:  # disco efêmero/sem permissão: o cache em memória ainda funciona
         print(f"[bling] aviso: não foi possível persistir tokens em disco: {e}")
+    # Persiste na env var do Railway para sobreviver a restarts (sem volume)
+    _persist_refresh_token_to_railway(data.get("refresh_token", ""))
 
 def _bling_load_tokens() -> dict | None:
     global _bling_tokens_cache
@@ -578,7 +622,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v14 - bling token rotation fix", status_code=200)
+    return HTMLResponse("v15 - bling token persist to railway", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
