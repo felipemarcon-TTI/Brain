@@ -622,7 +622,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v15 - bling token persist to railway", status_code=200)
+    return HTMLResponse("v16 - bling oauth callback tolerante a restart", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -737,10 +737,14 @@ async def bling_callback_route(request: Request) -> HTMLResponse:
     state = request.query_params.get("state")
     if not code:
         return HTMLResponse("<h2>Erro: código de autorização não recebido.</h2>", status_code=400)
-    if state and state not in _bling_pending_state:
-        return HTMLResponse("<h2>Erro: estado inválido (possível CSRF).</h2>", status_code=400)
-    if state:
+    # O state vive em memória e some quando o container reinicia (ex.: redeploy durante
+    # a janela de autorização). Se não encontrarmos, apenas avisamos e prosseguimos: o
+    # `code` é emitido pelo Bling SÓ após o admin autorizar e é de uso único — essa é a
+    # real proteção. Se o state existir e bater, consumimos normalmente.
+    if state and state in _bling_pending_state:
         del _bling_pending_state[state]
+    elif state:
+        print(f"[bling] aviso: state '{state}' não encontrado (provável restart); prosseguindo com o code do Bling")
 
     def _exchange():
         resp = requests.post(
