@@ -237,6 +237,55 @@ def _bling_post(path: str, body: dict) -> dict:
     return resp.json() if resp.content else {}
 
 
+def _bling_find_or_create_contact(email: str, nome: str, phone: str = "", cpf: str = "") -> int:
+    """Encontra contato no Bling por email/nome ou cria um novo."""
+    # Busca por email
+    if email:
+        try:
+            data = _bling_get("/contatos", {"email": email})
+            contacts = data.get("data", [])
+            if contacts:
+                return contacts[0]["id"]
+        except Exception:
+            pass
+    # Busca por nome
+    if nome:
+        try:
+            data = _bling_get("/contatos", {"nome": nome})
+            contacts = data.get("data", [])
+            for c in contacts:
+                if not email or (c.get("email") or "").lower() == email.lower():
+                    return c["id"]
+        except Exception:
+            pass
+    # Cria novo contato
+    body: dict = {"nome": nome or email, "tipoPessoa": "F", "indicadorIE": 9, "situacao": "A"}
+    if email:
+        body["email"] = email
+    if phone:
+        body["telefone"] = re.sub(r"\D", "", phone)[:20]
+    if cpf:
+        cpf_clean = re.sub(r"\D", "", cpf)
+        if len(cpf_clean) == 11:
+            body["cpf"] = cpf_clean
+    result = _bling_post("/contatos", body)
+    return result.get("data", {}).get("id")
+
+
+def _bling_find_product_by_sku(sku: str) -> int | None:
+    """Busca produto no Bling pelo código/SKU. Retorna o ID ou None."""
+    if not sku:
+        return None
+    try:
+        data = _bling_get("/produtos", {"codigo": sku})
+        produtos = data.get("data", [])
+        if produtos:
+            return produtos[0]["id"]
+    except Exception:
+        pass
+    return None
+
+
 # ── WooCommerce Tools ─────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -627,6 +676,60 @@ para que o servidor se autentique automaticamente após restarts:</p>
 <p>Pode fechar esta aba.</p>
 </body></html>"""
     return HTMLResponse(html)
+
+
+# ── Sync Route (chamada pelo Vercel após pagamento aprovado) ──────────────────
+
+@mcp.custom_route("/sync/pedido", methods=["POST"])
+async def sync_pedido_bling(request: Request) -> JSONResponse:
+    """Cria pedido de venda no Bling a partir de um pedido WooCommerce aprovado."""
+    try:
+        body = await request.json()
+        wc_order_id = body.get("wc_order_id")
+        billing     = body.get("billing", {})
+        items       = body.get("items", [])
+
+        if not wc_order_id or not items:
+            return JSONResponse({"error": "wc_order_id e items são obrigatórios"}, status_code=400)
+
+        def _run():
+            email = billing.get("email", "")
+            nome  = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip()
+            contact_id = _bling_find_or_create_contact(
+                email, nome, billing.get("phone", ""), billing.get("cpf", "")
+            )
+
+            bling_items = []
+            for item in items:
+                bi: dict = {
+                    "quantidade": item.get("quantity", 1),
+                    "valor":      float(item.get("unit_price", 0)),
+                    "tipo":       "P",
+                    "unidade":    "UN",
+                }
+                produto_id = _bling_find_product_by_sku(item.get("sku", ""))
+                if produto_id:
+                    bi["produto"] = {"id": produto_id}
+                else:
+                    bi["descricao"] = item.get("name", "Produto")
+                bling_items.append(bi)
+
+            pedido = _bling_post("/pedidos/vendas", {
+                "contato":             {"id": contact_id},
+                "data":                date.today().isoformat(),
+                "itens":               bling_items,
+                "numeroPedidoCompra":  str(wc_order_id),
+                "observacoes":         f"Pedido via site novo (WC #{wc_order_id})",
+            }).get("data", {})
+            return pedido.get("id")
+
+        bling_order_id = await anyio.to_thread.run_sync(_run)
+        print(f"[sync_pedido_bling] WC #{wc_order_id} → Bling #{bling_order_id}")
+        return JSONResponse({"ok": True, "bling_order_id": bling_order_id, "wc_order_id": wc_order_id})
+
+    except Exception as e:
+        print(f"[sync_pedido_bling] error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ── Bling Tools ───────────────────────────────────────────────────────────────
