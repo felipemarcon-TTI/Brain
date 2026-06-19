@@ -69,7 +69,7 @@ _users_by_token, _users_by_id = _load_users()
 
 _OPEN_PATHS = frozenset({
     "/", "/version", "/bling/callback", "/bling/persist-status", "/health/sistema",
-    "/meta/callback", "/meta/status", "/meta/teste",
+    "/meta/callback", "/meta/status", "/meta/teste", "/meta/webhook",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -769,7 +769,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v24 - Meta scopes validos (IG basic/comments/messages)", status_code=200)
+    return HTMLResponse("v25 - Meta Fase A: DMs (IG/Messenger) + facebook_posts + webhooks", status_code=200)
 
 
 @mcp.custom_route("/health/sistema", methods=["GET"])
@@ -1283,6 +1283,8 @@ META_SCOPES = ",".join([
 ])
 
 _meta_cache: dict | None = None
+META_WEBHOOK_VERIFY_TOKEN = os.environ.get("META_WEBHOOK_VERIFY_TOKEN", "")
+_meta_events: list = []  # últimos eventos recebidos via webhook (memória)
 
 
 def _railway_upsert_var(name: str, value: str) -> bool:
@@ -1578,6 +1580,121 @@ def ocultar_comentario(comentario_id: str, ocultar: bool = True) -> str:
     _require_write()
     _meta_post(f"{comentario_id}", {"hide": "true" if ocultar else "false"})
     return f"✅ Comentário {comentario_id} {'ocultado' if ocultar else 'reexibido'}."
+
+
+# ── Meta DMs (Instagram Direct + Messenger) ───────────────────────────────────
+
+@mcp.tool()
+def meta_conversas(plataforma: str = "instagram", limite: int = 20) -> str:
+    """Lista conversas de mensagem direta. plataforma: 'instagram' (Direct) ou 'facebook' (Messenger)."""
+    d = _meta_require()
+    plat = "instagram" if plataforma.lower().startswith("i") else "messenger"
+    data = _meta_get(f"{d['page_id']}/conversations", {
+        "platform": plat, "fields": "participants,updated_time,snippet", "limit": min(limite, 50)})
+    convs = data.get("data", [])
+    if not convs:
+        return f"Nenhuma conversa ({plat})."
+    linhas = []
+    for c in convs:
+        parts = ", ".join(p.get("username") or p.get("name") or p.get("id", "?")
+                          for p in (c.get("participants", {}) or {}).get("data", []))
+        linhas.append(f"- [{c['id']}] {parts} | {c.get('updated_time','')[:16]} | {(c.get('snippet') or '')[:50]}")
+    return f"**{len(convs)} conversa(s) ({plat}):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def meta_mensagens(conversa_id: str, limite: int = 20) -> str:
+    """Lê as mensagens de uma conversa (id vindo de meta_conversas), em ordem cronológica."""
+    d = _meta_require()
+    data = _meta_get(conversa_id, {"fields": f"messages.limit({min(limite,50)}){{message,from,created_time}}"})
+    msgs = (data.get("messages", {}) or {}).get("data", [])
+    if not msgs:
+        return "Nenhuma mensagem nesta conversa."
+    linhas = [f"- {m.get('created_time','')[:16]} | "
+              f"{m.get('from',{}).get('username') or m.get('from',{}).get('name','?')} "
+              f"(id {m.get('from',{}).get('id','?')}): {m.get('message','')}"
+              for m in reversed(msgs)]
+    return f"**{len(msgs)} mensagem(ns):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def meta_responder_dm(usuario_id: str, mensagem: str, plataforma: str = "instagram") -> str:
+    """Responde uma DM. usuario_id = id do remetente (campo from.id em meta_mensagens).
+    Respeita a janela de 24h da Meta para resposta humana."""
+    _require_write()
+    if not usuario_id or not mensagem.strip():
+        return "Erro: informe usuario_id e mensagem."
+    d = _meta_require()
+    try:
+        res = _meta_post(f"{d['page_id']}/messages", {
+            "recipient": json.dumps({"id": usuario_id}),
+            "message": json.dumps({"text": mensagem}),
+            "messaging_type": "RESPONSE",
+        })
+    except Exception as e:
+        return (f"Erro ao enviar DM: {e}\n(Se for fora da janela de 24h, a Meta bloqueia a "
+                f"resposta humana — só é possível responder até 24h após a última mensagem do cliente.)")
+    return f"✅ DM enviada para {usuario_id} (mid {res.get('message_id', '?')})."
+
+
+# ── Facebook (leitura de posts) ───────────────────────────────────────────────
+
+@mcp.tool()
+def facebook_posts(limite: int = 10) -> str:
+    """Lista posts recentes da Página do Facebook com curtidas e comentários (somente leitura)."""
+    d = _meta_require()
+    data = _meta_get(f"{d['page_id']}/posts", {
+        "fields": "id,message,created_time,permalink_url,likes.summary(true),comments.summary(true)",
+        "limit": min(limite, 50)})
+    posts = data.get("data", [])
+    if not posts:
+        return "Nenhum post na Página do Facebook."
+    linhas = []
+    for p in posts:
+        likes = (p.get("likes", {}) or {}).get("summary", {}).get("total_count", "?")
+        coms  = (p.get("comments", {}) or {}).get("summary", {}).get("total_count", "?")
+        msg = (p.get("message") or "").replace("\n", " ")[:60]
+        linhas.append(f"- [{p['id']}] {p.get('created_time','')[:10]} | ❤️ {likes} 💬 {coms} | {msg}")
+    return f"**{len(posts)} post(s) do Facebook:**\n" + "\n".join(linhas)
+
+
+# ── Webhooks (tempo real) ─────────────────────────────────────────────────────
+
+@mcp.custom_route("/meta/webhook", methods=["GET", "POST"])
+async def meta_webhook(request: Request):
+    if request.method == "GET":
+        qp = request.query_params
+        if (qp.get("hub.mode") == "subscribe" and META_WEBHOOK_VERIFY_TOKEN
+                and qp.get("hub.verify_token") == META_WEBHOOK_VERIFY_TOKEN):
+            return HTMLResponse(qp.get("hub.challenge", ""), status_code=200)
+        return HTMLResponse("forbidden", status_code=403)
+    try:
+        body = await request.json()
+        import datetime as _dt
+        _meta_events.append({"ts": _dt.datetime.now().isoformat(timespec="seconds"), "data": body})
+        del _meta_events[:-50]
+    except Exception as e:
+        print(f"[meta webhook] erro: {e}")
+    return JSONResponse({"ok": True})
+
+
+@mcp.tool()
+def meta_eventos_recentes(limite: int = 20) -> str:
+    """Lista os eventos recebidos por webhook (comentários/DMs novos), mais recentes primeiro."""
+    if not _meta_events:
+        return "Nenhum evento recebido ainda. Confira a configuração de Webhooks no app Meta."
+    evs = _meta_events[-limite:][::-1]
+    return f"**{len(evs)} evento(s):**\n" + "\n".join(f"- {e['ts']}: {json.dumps(e['data'])[:200]}" for e in evs)
+
+
+@mcp.tool()
+def meta_assinar_webhooks() -> str:
+    """Inscreve a Página nos webhooks (feed + mensagens). Rode 1x após configurar o webhook no app Meta."""
+    _require_write()
+    d = _meta_require()
+    res = _meta_post(f"{d['page_id']}/subscribed_apps",
+                     {"subscribed_fields": "feed,messages,message_reactions,messaging_postbacks"})
+    return f"✅ Página inscrita nos webhooks: {res}"
 
 
 # ── Admin API ─────────────────────────────────────────────────────────────────
