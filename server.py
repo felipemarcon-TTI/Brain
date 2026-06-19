@@ -1623,11 +1623,21 @@ async def meta_enviar_dm_unico(request: Request) -> JSONResponse:
                     break
             if not uid:
                 return {"erro": "from.id do usuário não encontrado", "msgs": len(msgs)}
-            res = _meta_post(f"{d['page_id']}/messages", {
-                "recipient": json.dumps({"id": uid}),
-                "message": json.dumps({"text": MSG}),
-            })
-            return {"enviado_para": uid, "mensagem": MSG, "resultado": res}
+            try:
+                res = _meta_post(f"{d['page_id']}/messages", {
+                    "recipient": json.dumps({"id": uid}),
+                    "message": json.dumps({"text": MSG}),
+                })
+                return {"enviado_para": uid, "modo": "padrao", "resultado": res}
+            except Exception as e1:
+                res = _meta_post(f"{d['page_id']}/messages", {
+                    "recipient": json.dumps({"id": uid}),
+                    "message": json.dumps({"text": MSG}),
+                    "messaging_type": "MESSAGE_TAG",
+                    "tag": "HUMAN_AGENT",
+                })
+                return {"enviado_para": uid, "modo": "human_agent", "resultado": res,
+                        "erro_padrao": str(e1)[:200]}
         except Exception as e:
             return {"erro_envio": str(e)[:400], "uid_resolvido": uid}
     res = await anyio.to_thread.run_sync(_run)
