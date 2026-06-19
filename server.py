@@ -628,7 +628,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v19 - force-persist endpoint", status_code=200)
+    return HTMLResponse("v20 - atribuicao afiliado/utm em observacoesInternas", status_code=200)
 
 
 @mcp.custom_route("/bling/persist-status", methods=["GET"])
@@ -826,6 +826,12 @@ async def sync_pedido_bling(request: Request) -> JSONResponse:
         discount    = float(body.get("discount", 0) or 0)
         shipping    = float(body.get("shipping", 0) or 0)
         coupon      = body.get("coupon", "") or ""
+        # Atribuição de afiliado/campanha — vai SÓ em observacoesInternas (fora da NF)
+        coupon_owner = body.get("coupon_owner", "") or ""
+        affiliate    = body.get("affiliate", "") or ""
+        utm_source   = body.get("utm_source", "") or ""
+        utm_medium   = body.get("utm_medium", "") or ""
+        utm_campaign = body.get("utm_campaign", "") or ""
 
         if not wc_order_id or not items:
             return JSONResponse({"error": "wc_order_id e items são obrigatórios"}, status_code=400)
@@ -858,6 +864,16 @@ async def sync_pedido_bling(request: Request) -> JSONResponse:
             if shipping:
                 obs += f" | Frete: R$ {shipping:.2f}"
 
+            # Observações Internas (NÃO saem na NF) — atribuição completa p/ consistência.
+            # Cupom também entra aqui (além de observacoes) conforme pedido.
+            internas = []
+            if coupon:       internas.append(f"Cupom: {coupon}")
+            if coupon_owner: internas.append(f"Dono do cupom: {coupon_owner}")
+            if affiliate:    internas.append(f"Afiliado: {affiliate}")
+            if utm_source:   internas.append(f"utm_source: {utm_source}")
+            if utm_medium:   internas.append(f"utm_medium: {utm_medium}")
+            if utm_campaign: internas.append(f"utm_campaign: {utm_campaign}")
+
             payload: dict = {
                 "contato":             {"id": contact_id},
                 "data":                date.today().isoformat(),
@@ -865,6 +881,8 @@ async def sync_pedido_bling(request: Request) -> JSONResponse:
                 "numeroPedidoCompra":  str(wc_order_id),
                 "observacoes":         obs,
             }
+            if internas:
+                payload["observacoesInternas"] = " | ".join(internas)
             # Desconto do cupom: itens vão a preço cheio e o abatimento entra aqui,
             # para o total do Bling bater com o total pago no site.
             if discount > 0:
