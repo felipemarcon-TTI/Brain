@@ -68,7 +68,7 @@ _users_by_token, _users_by_id = _load_users()
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
 _OPEN_PATHS = frozenset({
-    "/", "/version", "/bling/callback",
+    "/", "/version", "/bling/callback", "/bling/persist-status",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -186,6 +186,7 @@ def _bling_credentials_header() -> str:
 # reusar um refresh_token que o Bling já invalidou (causa do erro 400).
 _bling_lock = threading.Lock()
 _bling_tokens_cache: dict | None = None
+_last_persist_result: str = "ainda não tentou"
 
 def _persist_refresh_token_to_railway(refresh_token: str) -> bool:
     """Persiste o refresh_token rotacionado na env var BLING_REFRESH_TOKEN do próprio
@@ -199,11 +200,13 @@ def _persist_refresh_token_to_railway(refresh_token: str) -> bool:
     project_id     = os.environ.get("RAILWAY_PROJECT_ID", "")
     environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
     service_id     = os.environ.get("RAILWAY_SERVICE_ID", "")
+    global _last_persist_result
     missing = [k for k, v in {
         "RAILWAY_API_TOKEN": api_token, "RAILWAY_PROJECT_ID": project_id,
         "RAILWAY_ENVIRONMENT_ID": environment_id, "RAILWAY_SERVICE_ID": service_id,
     }.items() if not v]
     if missing or not refresh_token:
+        _last_persist_result = f"ignorado - faltam vars: {missing}"
         print(f"[railway] persist ignorado - faltam vars: {missing}")
         return False
     query = "mutation variableUpsert($input: VariableUpsertInput!) { variableUpsert(input: $input) }"
@@ -221,11 +224,14 @@ def _persist_refresh_token_to_railway(refresh_token: str) -> bool:
         resp.raise_for_status()
         body = resp.json()
         if body.get("errors"):
+            _last_persist_result = f"erro GraphQL: {str(body['errors'])[:200]}"
             print(f"[railway] variableUpsert errors: {body['errors']}")
             return False
+        _last_persist_result = "OK"
         print("[railway] variableUpsert OK - BLING_REFRESH_TOKEN atualizado")
         return True
     except Exception as e:
+        _last_persist_result = f"exception: {str(e)[:200]}"
         print(f"[railway] variableUpsert exception: {e}")
         return False
 
@@ -622,7 +628,21 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v17 - sync bling com desconto/frete", status_code=200)
+    return HTMLResponse("v18 - diagnostico de persistencia", status_code=200)
+
+
+@mcp.custom_route("/bling/persist-status", methods=["GET"])
+async def bling_persist_status(request: Request) -> JSONResponse:
+    """Diagnóstico (protegido por auth): mostra se a persistência no Railway está
+    configurada e o resultado da última gravação. NÃO expõe valores de segredos."""
+    return JSONResponse({
+        "RAILWAY_API_TOKEN_present":     bool(os.environ.get("RAILWAY_API_TOKEN")),
+        "RAILWAY_PROJECT_ID_present":     bool(os.environ.get("RAILWAY_PROJECT_ID")),
+        "RAILWAY_ENVIRONMENT_ID_present": bool(os.environ.get("RAILWAY_ENVIRONMENT_ID")),
+        "RAILWAY_SERVICE_ID_present":     bool(os.environ.get("RAILWAY_SERVICE_ID")),
+        "ultimo_resultado_persist":      _last_persist_result,
+        "tem_token_em_cache":            _bling_tokens_cache is not None,
+    })
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
