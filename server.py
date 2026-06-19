@@ -628,21 +628,43 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v18 - diagnostico de persistencia", status_code=200)
+    return HTMLResponse("v19 - force-persist endpoint", status_code=200)
 
 
 @mcp.custom_route("/bling/persist-status", methods=["GET"])
 async def bling_persist_status(request: Request) -> JSONResponse:
-    """Diagnóstico (protegido por auth): mostra se a persistência no Railway está
-    configurada e o resultado da última gravação. NÃO expõe valores de segredos."""
+    """Diagnóstico público: mostra se a persistência no Railway está configurada.
+    NÃO expõe valores de segredos."""
+    ultimo = _last_persist_result
+    dica = None
+    if "Not Authorized" in ultimo:
+        dica = (
+            "RAILWAY_API_TOKEN precisa ser um Personal Access Token "
+            "(railway.app > Account Settings > API > Generate Token). "
+            "Tokens de projeto/deploy NÃO têm permissão para variableUpsert. "
+            "Após corrigir o token, chame POST /bling/force-persist (com Bearer auth)."
+        )
     return JSONResponse({
         "RAILWAY_API_TOKEN_present":     bool(os.environ.get("RAILWAY_API_TOKEN")),
         "RAILWAY_PROJECT_ID_present":     bool(os.environ.get("RAILWAY_PROJECT_ID")),
         "RAILWAY_ENVIRONMENT_ID_present": bool(os.environ.get("RAILWAY_ENVIRONMENT_ID")),
         "RAILWAY_SERVICE_ID_present":     bool(os.environ.get("RAILWAY_SERVICE_ID")),
-        "ultimo_resultado_persist":      _last_persist_result,
+        "ultimo_resultado_persist":      ultimo,
         "tem_token_em_cache":            _bling_tokens_cache is not None,
+        **({"dica": dica} if dica else {}),
     })
+
+
+@mcp.custom_route("/bling/force-persist", methods=["POST"])
+async def bling_force_persist(request: Request) -> JSONResponse:
+    """Força uma nova tentativa de persistir o refresh_token atual no Railway.
+    Use isso após corrigir o RAILWAY_API_TOKEN para que a rotação sobreviva
+    ao próximo restart sem nova autenticação OAuth."""
+    tokens = _bling_tokens_cache
+    if not tokens or not tokens.get("refresh_token"):
+        return JSONResponse({"ok": False, "erro": "Nenhum token em cache. Autentique via /bling/auth primeiro."}, status_code=400)
+    ok = await anyio.to_thread.run_sync(lambda: _persist_refresh_token_to_railway(tokens["refresh_token"]))
+    return JSONResponse({"ok": ok, "resultado": _last_persist_result})
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
