@@ -1600,29 +1600,36 @@ async def meta_enviar_dm_unico(request: Request) -> JSONResponse:
         return JSONResponse({"erro": "forbidden"}, status_code=403)
 
     def _run():
+        uid = None
         try:
             d = _meta_load()
             if not d or not d.get("page_id"):
                 return {"erro": "não conectado"}
             convs = _meta_get(f"{d['page_id']}/conversations",
                               {"platform": "instagram", "fields": "participants", "limit": 50}).get("data", [])
-            uid = None
+            conv_id = None
             for c in convs:
-                for p in (c.get("participants", {}) or {}).get("data", []):
-                    if (p.get("username") or "").lower() == ALVO and p.get("id") not in (d.get("ig_id"), d.get("page_id")):
-                        uid = p.get("id")
-                if uid:
+                nomes = [(p.get("username") or "").lower() for p in (c.get("participants", {}) or {}).get("data", [])]
+                if ALVO in nomes:
+                    conv_id = c["id"]
+                    break
+            if not conv_id:
+                return {"erro": f"conversa com @{ALVO} não encontrada", "convs": len(convs)}
+            msgs = _meta_get(conv_id, {"fields": "messages.limit(25){message,from,created_time}"}) \
+                .get("messages", {}).get("data", [])
+            for m in msgs:
+                if (m.get("from", {}).get("username") or "").lower() == ALVO:
+                    uid = m.get("from", {}).get("id")
                     break
             if not uid:
-                return {"erro": f"conversa com @{ALVO} não encontrada", "convs": len(convs)}
+                return {"erro": "from.id do usuário não encontrado", "msgs": len(msgs)}
             res = _meta_post(f"{d['page_id']}/messages", {
                 "recipient": json.dumps({"id": uid}),
                 "message": json.dumps({"text": MSG}),
-                "messaging_type": "RESPONSE",
             })
             return {"enviado_para": uid, "mensagem": MSG, "resultado": res}
         except Exception as e:
-            return {"erro_envio": str(e)[:400]}
+            return {"erro_envio": str(e)[:400], "uid_resolvido": uid}
     res = await anyio.to_thread.run_sync(_run)
     return JSONResponse(res)
 
