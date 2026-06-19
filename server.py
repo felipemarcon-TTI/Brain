@@ -544,6 +544,71 @@ def revogar_cupom(codigo: str, motivo: str = "") -> str:
 
 
 @mcp.tool()
+def listar_cupons(apenas_ativos: bool = True) -> str:
+    """Lista os cupons de desconto cadastrados no WooCommerce.
+
+    apenas_ativos: se True (padrão), mostra só os cupons válidos hoje (não expirados e
+      que ainda têm usos disponíveis). Se False, lista TODOS, inclusive expirados/esgotados.
+    Para cada cupom retorna: código, desconto, frete grátis, validade, usos (usados/limite)
+    e o afiliado dono (se houver token [afiliado:@x] na descrição).
+    """
+    try:
+        cupons = _wc_get_all("coupons")
+    except Exception as e:
+        return f"Erro ao listar cupons no WooCommerce: {e}"
+    if not cupons:
+        return "Nenhum cupom cadastrado no WooCommerce."
+
+    hoje = date.today().isoformat()
+
+    def _ativo(c: dict) -> bool:
+        exp = c.get("date_expires")  # ex.: "2026-06-30T00:00:00" ou None
+        if exp and exp[:10] < hoje:
+            return False
+        limite = c.get("usage_limit")
+        if limite and int(c.get("usage_count") or 0) >= int(limite):
+            return False
+        return True
+
+    linhas, total_ativos = [], 0
+    for c in cupons:
+        ativo = _ativo(c)
+        if ativo:
+            total_ativos += 1
+        if apenas_ativos and not ativo:
+            continue
+        codigo = c.get("code", "?")
+        tipo   = c.get("discount_type", "")
+        valor  = c.get("amount", "0")
+        if tipo == "percent":
+            desc = f"{float(valor):g}% off"
+        elif tipo in ("fixed_cart", "fixed_product"):
+            desc = f"R$ {float(valor):g} off"
+        else:
+            desc = f"{valor} ({tipo})"
+        exp      = c.get("date_expires")
+        validade = exp[:10] if exp else "sem validade"
+        usados   = int(c.get("usage_count") or 0)
+        limite   = c.get("usage_limit")
+        usos     = f"{usados}/{limite}" if limite else f"{usados}/∞"
+        frete    = " | frete grátis" if c.get("free_shipping") else ""
+        m        = re.search(r"\[afiliado:\s*(@?[^\]]+)\]", c.get("description") or "")
+        afil     = f" | afiliado {m.group(1).strip()}" if m else ""
+        status   = "" if ativo else " ⛔ (expirado/esgotado)"
+        linhas.append(
+            f"- **{codigo}** — {desc}{frete} | validade: {validade} | usos: {usos}{afil}{status}"
+        )
+
+    if not linhas:
+        return ("Nenhum cupom ATIVO no momento (há cupons expirados/esgotados; "
+                "chame com apenas_ativos=False para vê-los).")
+
+    cabecalho = (f"**{total_ativos} cupom(ns) ativo(s)**" if apenas_ativos
+                 else f"**{len(cupons)} cupom(ns) no total ({total_ativos} ativo(s))**")
+    return cabecalho + ":\n" + "\n".join(linhas)
+
+
+@mcp.tool()
 def criar_afiliado(arroba: str) -> str:
     """Gera o link de afiliado (UTM) e registra na planilha de Afiliados. NÃO expira.
 
