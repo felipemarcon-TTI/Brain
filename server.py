@@ -769,7 +769,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v25 - Meta Fase A: DMs (IG/Messenger) + facebook_posts + webhooks", status_code=200)
+    return HTMLResponse("v26 - buscar_pedido_venda_bling (detalhe completo de pedido no Bling)", status_code=200)
 
 
 @mcp.custom_route("/health/sistema", methods=["GET"])
