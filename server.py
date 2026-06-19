@@ -69,7 +69,7 @@ _users_by_token, _users_by_id = _load_users()
 
 _OPEN_PATHS = frozenset({
     "/", "/version", "/bling/callback", "/bling/persist-status", "/health/sistema",
-    "/meta/callback", "/meta/status",
+    "/meta/callback", "/meta/status", "/meta/teste",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -1413,6 +1413,38 @@ async def meta_callback(request: Request) -> HTMLResponse:
         "<h2 style='color:green'>Meta conectado com sucesso!</h2>"
         f"<p>Página: <b>{data['page_name']}</b> (id {data['page_id']})</p>"
         f"<p>{ig_msg}</p><p>Pode fechar esta aba.</p></body>")
+
+
+@mcp.custom_route("/meta/teste", methods=["GET"])
+async def meta_teste(request: Request) -> JSONResponse:
+    """Diagnóstico: exercita as mesmas chamadas das tools (resumo + posts + comentários)
+    com o token salvo, para validar a integração de ponta a ponta."""
+    def _run():
+        out: dict = {}
+        d = _meta_load()
+        if not d or not d.get("ig_id"):
+            return {"erro": "não conectado ou Instagram não vinculado"}
+        ig = d["ig_id"]
+        try:
+            out["resumo"] = _meta_get(ig, {"fields": "username,followers_count,media_count"})
+        except Exception as e:
+            out["resumo_erro"] = str(e)[:200]
+        try:
+            posts = _meta_get(f"{ig}/media", {
+                "fields": "id,caption,media_type,like_count,comments_count,timestamp",
+                "limit": 5}).get("data", [])
+            out["posts"] = [{"id": p["id"], "likes": p.get("like_count"),
+                             "comentarios": p.get("comments_count"), "tipo": p.get("media_type"),
+                             "data": (p.get("timestamp") or "")[:10]} for p in posts]
+            alvo = next((p for p in posts if (p.get("comments_count") or 0) > 0), None)
+            if alvo:
+                cs = _meta_get(f"{alvo['id']}/comments", {"fields": "id,text,username", "limit": 3}).get("data", [])
+                out["amostra_comentarios"] = [{"user": c.get("username"), "text": (c.get("text") or "")[:60]} for c in cs]
+        except Exception as e:
+            out["posts_erro"] = str(e)[:200]
+        return out
+    res = await anyio.to_thread.run_sync(_run)
+    return JSONResponse(res)
 
 
 @mcp.custom_route("/meta/status", methods=["GET"])
