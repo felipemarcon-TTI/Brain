@@ -1163,6 +1163,70 @@ def listar_pedidos_venda_bling(pagina: int = 1, limite: int = 100, situacao: int
 
 
 @mcp.tool()
+def buscar_pedido_venda_bling(id_pedido: int) -> str:
+    """
+    Retorna os detalhes completos de um pedido de venda do Bling! pelo seu ID
+    (o ID que aparece entre colchetes em listar_pedidos_venda_bling).
+    Inclui cliente/documento, itens, frete, endereço de entrega, pagamento e observações.
+    """
+    p = _bling_get(f"/pedidos/vendas/{id_pedido}").get("data", {})
+    if not p:
+        return f"Pedido {id_pedido} não encontrado no Bling."
+
+    contato = p.get("contato", {}) or {}
+    situacao = p.get("situacao", {}) or {}
+    transporte = p.get("transporte", {}) or {}
+    etiqueta = transporte.get("etiqueta", {}) or {}
+    parcelas = p.get("parcelas", []) or []
+    itens = p.get("itens", []) or []
+
+    linhas_itens = "\n".join(
+        f"  - {i.get('descricao', '?')} x{i.get('quantidade', 0):g} = "
+        f"R$ {float(i.get('valor', 0)) * float(i.get('quantidade', 1)):.2f} "
+        f"(unit. R$ {float(i.get('valor', 0)):.2f}{', cód. ' + i['codigo'] if i.get('codigo') else ''})"
+        for i in itens
+    ) or "  (sem itens)"
+
+    linhas_parcelas = "\n".join(
+        f"  - Parc. {pc.get('data', '-')}: R$ {float(pc.get('valor', 0)):.2f}"
+        f"{' — ' + pc.get('formaPagamento', {}).get('descricao', '') if isinstance(pc.get('formaPagamento'), dict) else ''}"
+        for pc in parcelas
+    ) or "  (sem parcelas registradas)"
+
+    # Endereço de entrega (etiqueta do transporte)
+    if etiqueta:
+        endereco = (
+            f"{etiqueta.get('nome', '')}\n"
+            f"    {etiqueta.get('endereco', '')}, {etiqueta.get('numero', '')}"
+            f"{' - ' + etiqueta['complemento'] if etiqueta.get('complemento') else ''}\n"
+            f"    {etiqueta.get('bairro', '')} - {etiqueta.get('municipio', '')}/{etiqueta.get('uf', '')}"
+            f" - CEP {etiqueta.get('cep', '')}"
+        )
+    else:
+        endereco = "(sem endereço de entrega no pedido)"
+
+    frete_por_conta = {0: "Remetente (CIF)", 1: "Destinatário (FOB)"}.get(
+        transporte.get("fretePorConta"), str(transporte.get("fretePorConta", "-"))
+    )
+
+    return (
+        f"**Pedido de venda Bling #{p.get('numero', id_pedido)}** (ID {p.get('id', id_pedido)})\n"
+        f"- Data: {p.get('data', '-')} | Situação: {situacao.get('valor', situacao.get('id', '-'))}\n"
+        f"- Nº pedido externo (loja): {p.get('numeroPedidoCompra') or p.get('numeroLoja') or '-'}\n"
+        f"- Cliente: {contato.get('nome', '?')} | Doc: {contato.get('numeroDocumento', '-')} (ID contato {contato.get('id', '-')})\n"
+        f"- Itens:\n{linhas_itens}\n"
+        f"- Total produtos: R$ {float(p.get('totalProdutos', 0)):.2f}\n"
+        f"- Frete: R$ {float(transporte.get('frete', 0)):.2f} | Por conta: {frete_por_conta}"
+        f" | Transportadora: {transporte.get('contato', {}).get('nome', '-') if isinstance(transporte.get('contato'), dict) else '-'}\n"
+        f"- Total do pedido: R$ {float(p.get('total', 0)):.2f}\n"
+        f"- Endereço de entrega:\n    {endereco}\n"
+        f"- Pagamento:\n{linhas_parcelas}\n"
+        f"- Observações: {p.get('observacoes') or '-'}\n"
+        f"- Observações internas: {p.get('observacoesInternas') or '-'}"
+    )
+
+
+@mcp.tool()
 def consultar_estoque_bling(id_produto: int) -> str:
     """Consulta o saldo de estoque de um produto pelo seu ID."""
     token = _bling_get_token()
