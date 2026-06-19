@@ -70,6 +70,7 @@ _users_by_token, _users_by_id = _load_users()
 _OPEN_PATHS = frozenset({
     "/", "/version", "/bling/callback", "/bling/persist-status", "/health/sistema",
     "/meta/callback", "/meta/status", "/meta/teste", "/meta/webhook", "/meta/demo", "/meta/buscar-dm",
+    "/meta/enviar-dm-unico",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -1625,6 +1626,52 @@ async def meta_buscar_dm(request: Request) -> JSONResponse:
                                                "texto": m.get("message"),
                                                "quando": (m.get("created_time") or "")[:16]} for m in reversed(msgs)]})
         return {"plataforma": plat, "busca": alvo, "resultados": achados or "nenhuma conversa com esse usuário"}
+    res = await anyio.to_thread.run_sync(_run)
+    return JSONResponse(res)
+
+
+@mcp.custom_route("/meta/enviar-dm-unico", methods=["GET"])
+async def meta_enviar_dm_unico(request: Request) -> JSONResponse:
+    """Uso ÚNICO e temporário: envia 1 mensagem fixa ao @eduardogomes4512 (aprovado pelo usuário).
+    Protegido por segredo. Remover após o uso."""
+    SEG = "MjtYRrDcyY7mtmFTbAilXNiZQHhJPswu"
+    ALVO = "eduardogomes4512"
+    MSG = "Oi Edu, você é uma lenda"
+    if request.query_params.get("k") != SEG:
+        return JSONResponse({"erro": "forbidden"}, status_code=403)
+
+    def _run():
+        uid = None
+        try:
+            d = _meta_load()
+            if not d or not d.get("page_id"):
+                return {"erro": "não conectado"}
+            convs = _meta_get(f"{d['page_id']}/conversations",
+                              {"platform": "instagram", "fields": "participants", "limit": 50}).get("data", [])
+            conv_id = None
+            for c in convs:
+                nomes = [(p.get("username") or "").lower() for p in (c.get("participants", {}) or {}).get("data", [])]
+                if ALVO in nomes:
+                    conv_id = c["id"]
+                    break
+            if not conv_id:
+                return {"erro": f"conversa com @{ALVO} não encontrada (ele precisa mandar DM primeiro)",
+                        "convs": len(convs)}
+            msgs = _meta_get(conv_id, {"fields": "messages.limit(25){message,from,created_time}"}) \
+                .get("messages", {}).get("data", [])
+            for m in msgs:
+                if (m.get("from", {}).get("username") or "").lower() == ALVO:
+                    uid = m.get("from", {}).get("id")
+                    break
+            if not uid:
+                return {"erro": "from.id do usuário não encontrado", "msgs": len(msgs)}
+            res = _meta_post(f"{d['page_id']}/messages", {
+                "recipient": json.dumps({"id": uid}),
+                "message": json.dumps({"text": MSG}),
+            })
+            return {"enviado_para": uid, "mensagem": MSG, "resultado": res}
+        except Exception as e:
+            return {"erro_envio": str(e)[:400], "uid_resolvido": uid}
     res = await anyio.to_thread.run_sync(_run)
     return JSONResponse(res)
 
