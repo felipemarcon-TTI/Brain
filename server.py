@@ -70,6 +70,7 @@ _users_by_token, _users_by_id = _load_users()
 _OPEN_PATHS = frozenset({
     "/", "/version", "/bling/callback", "/bling/persist-status", "/health/sistema",
     "/meta/callback", "/meta/status", "/meta/teste", "/meta/webhook", "/meta/demo", "/meta/buscar-dm",
+    "/meta/enviar-dm-unico",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -1583,6 +1584,42 @@ async def meta_buscar_dm(request: Request) -> JSONResponse:
                                                "texto": m.get("message"),
                                                "quando": (m.get("created_time") or "")[:16]} for m in reversed(msgs)]})
         return {"plataforma": plat, "busca": alvo, "resultados": achados or "nenhuma conversa com esse usuário"}
+    res = await anyio.to_thread.run_sync(_run)
+    return JSONResponse(res)
+
+
+@mcp.custom_route("/meta/enviar-dm-unico", methods=["GET"])
+async def meta_enviar_dm_unico(request: Request) -> JSONResponse:
+    """Uso ÚNICO e temporário: envia 1 mensagem fixa ao @marconflpe (aprovado pelo usuário).
+    Protegido por segredo. Remover após o uso."""
+    SEG = "a0u8bmvpGaLenvm2fqGz5ACYb0cwVWUC"
+    ALVO = "marconflpe"
+    MSG = ("Oi! 🐾 Recebido — teste funcionando certinho por aqui. "
+           "Qualquer dúvida sobre os produtos da Vienna Pet, é só chamar! 💚")
+    if request.query_params.get("k") != SEG:
+        return JSONResponse({"erro": "forbidden"}, status_code=403)
+
+    def _run():
+        d = _meta_load()
+        if not d or not d.get("page_id"):
+            return {"erro": "não conectado"}
+        convs = _meta_get(f"{d['page_id']}/conversations",
+                          {"platform": "instagram", "fields": "participants", "limit": 50}).get("data", [])
+        uid = None
+        for c in convs:
+            for p in (c.get("participants", {}) or {}).get("data", []):
+                if (p.get("username") or "").lower() == ALVO and p.get("id") not in (d.get("ig_id"), d.get("page_id")):
+                    uid = p.get("id")
+            if uid:
+                break
+        if not uid:
+            return {"erro": f"conversa com @{ALVO} não encontrada"}
+        res = _meta_post(f"{d['page_id']}/messages", {
+            "recipient": json.dumps({"id": uid}),
+            "message": json.dumps({"text": MSG}),
+            "messaging_type": "RESPONSE",
+        })
+        return {"enviado_para": uid, "mensagem": MSG, "resultado": res}
     res = await anyio.to_thread.run_sync(_run)
     return JSONResponse(res)
 
