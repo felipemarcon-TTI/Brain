@@ -172,59 +172,40 @@ def _wp_post(endpoint: str, data: dict) -> dict:
     return resp.json()
 
 
-# ── Google Sheets (planilhas de Cupons e Afiliados) ───────────────────────────
-# A planilha é o REGISTRO. A tool grava nela via Service Account (GOOGLE_SA_JSON).
-# Compartilhe as 2 planilhas com o e-mail do service account (como Editor).
+# ── Planilhas (Cupons e Afiliados) via Apps Script Web App ────────────────────
+# A planilha é o REGISTRO. Em vez de chave de Service Account (bloqueada pela
+# política da org), usamos um Apps Script publicado como Web App: o MCP faz POST
+# com um segredo e o script grava/atualiza a linha. Sem chave => sem bloqueio.
+# Config no Railway: SHEETS_WEBHOOK_URL (URL /exec do Web App) e SHEETS_SECRET.
 
-CUPONS_SHEET_ID    = os.environ.get("CUPONS_SHEET_ID", "1RBzTk8hG-bZCfOYnxFFuENifKaGEycMYBVCmLity2bw")
-AFILIADOS_SHEET_ID = os.environ.get("AFILIADOS_SHEET_ID", "1XTRoCdnBjZ2ZZw6ixCuVuBDIOilTTrjW18-F8aDLHfM")
-
-_CUPONS_HEADER    = ["Código do Cupom", "Data de Validade", "Desconto (%)", "@ Dono do Cupom", "Observação"]
-_AFILIADOS_HEADER = ["@ da Pessoa", "URL do Link"]
-
-
-def _gspread_ws(sheet_id: str, header: list[str]):
-    """Abre a primeira aba da planilha e garante o cabeçalho. Requer GOOGLE_SA_JSON."""
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    raw = os.environ.get("GOOGLE_SA_JSON", "")
-    if not raw:
-        raise RuntimeError("GOOGLE_SA_JSON não configurado no Railway (Service Account).")
-    info = json.loads(raw)
-    creds = Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    ws = gspread.authorize(creds).open_by_key(sheet_id).sheet1
-    # Normaliza o cabeçalho (idempotente)
-    first = ws.row_values(1)
-    if [c.strip() for c in first][: len(header)] != header:
-        ws.update(f"A1:{chr(64 + len(header))}1", [header])
-    return ws
+SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
+SHEETS_SECRET      = os.environ.get("SHEETS_SECRET", "")
 
 
-def _sheet_append_cupom(row: list) -> None:
-    ws = _gspread_ws(CUPONS_SHEET_ID, _CUPONS_HEADER)
-    ws.append_row([str(c) for c in row], value_input_option="USER_ENTERED")
+def _sheets_post(payload: dict) -> dict:
+    if not SHEETS_WEBHOOK_URL or not SHEETS_SECRET:
+        raise RuntimeError("SHEETS_WEBHOOK_URL/SHEETS_SECRET não configurados (Apps Script).")
+    resp = requests.post(SHEETS_WEBHOOK_URL, json={**payload, "secret": SHEETS_SECRET}, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Apps Script: {data.get('error')}")
+    return data
 
 
-def _sheet_append_afiliado(row: list) -> None:
-    ws = _gspread_ws(AFILIADOS_SHEET_ID, _AFILIADOS_HEADER)
-    ws.append_row([str(c) for c in row], value_input_option="USER_ENTERED")
+def _sheet_append_cupom(codigo, validade, desconto, dono, obs="") -> None:
+    _sheets_post({"action": "append_cupom", "codigo": codigo, "validade": validade,
+                  "desconto": desconto, "dono": dono, "obs": obs})
+
+
+def _sheet_append_afiliado(arroba, url) -> None:
+    _sheets_post({"action": "append_afiliado", "arroba": arroba, "url": url})
 
 
 def _sheet_revogar_cupom(codigo: str, nova_validade: str, observacao: str) -> bool:
-    """Acha a linha do cupom (col A) e atualiza Validade (col B) e Observação (col E)."""
-    ws = _gspread_ws(CUPONS_SHEET_ID, _CUPONS_HEADER)
-    try:
-        cell = ws.find(codigo)
-    except Exception:
-        cell = None
-    if not cell:
-        return False
-    ws.update_cell(cell.row, 2, nova_validade)   # B = Validade
-    ws.update_cell(cell.row, 5, observacao)       # E = Observação
-    return True
+    d = _sheets_post({"action": "revoke_cupom", "codigo": codigo,
+                      "validade": nova_validade, "obs": observacao})
+    return bool(d.get("found"))
 
 
 # ── Bling helpers ─────────────────────────────────────────────────────────────
@@ -475,7 +456,7 @@ def criar_cupom(codigo: str, data_validade: str, desconto_percentual: float, don
 
     # 2) registra na planilha
     try:
-        _sheet_append_cupom([codigo, data_validade, desconto_percentual, dono_arroba, ""])
+        _sheet_append_cupom(codigo, data_validade, desconto_percentual, dono_arroba)
         reg = "registrado na planilha"
     except Exception as e:
         reg = f"⚠️ criado no WC (#{wc_id}) mas FALHOU registrar na planilha: {e}"
@@ -533,7 +514,7 @@ def criar_afiliado(arroba: str) -> str:
     handle = arroba.lstrip("@")
     url = f"https://www.viennapet.com.br/?utm_source={handle}&utm_medium=affiliate&utm_campaign=afiliados"
     try:
-        _sheet_append_afiliado([arroba, url])
+        _sheet_append_afiliado(arroba, url)
         reg = "registrado na planilha"
     except Exception as e:
         reg = f"⚠️ link gerado mas FALHOU registrar na planilha: {e}"
@@ -787,7 +768,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v21 - tools criar_cupom/criar_afiliado/revogar_cupom + /health/sistema", status_code=200)
+    return HTMLResponse("v22 - planilhas via Apps Script Web App (sem service account)", status_code=200)
 
 
 @mcp.custom_route("/health/sistema", methods=["GET"])
@@ -819,8 +800,7 @@ async def health_sistema(request: Request) -> JSONResponse:
         except Exception as e:
             out["frete"] = f"erro: {str(e)[:80]}"
         try:
-            _gspread_ws(CUPONS_SHEET_ID, _CUPONS_HEADER)
-            _gspread_ws(AFILIADOS_SHEET_ID, _AFILIADOS_HEADER)
+            _sheets_post({"action": "ping"})
             out["planilhas"] = "ok"
         except Exception as e:
             out["planilhas"] = f"erro: {str(e)[:80]}"
