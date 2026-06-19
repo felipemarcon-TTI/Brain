@@ -69,7 +69,7 @@ _users_by_token, _users_by_id = _load_users()
 
 _OPEN_PATHS = frozenset({
     "/", "/version", "/bling/callback", "/bling/persist-status", "/health/sistema",
-    "/meta/callback", "/meta/status", "/meta/teste", "/meta/webhook",
+    "/meta/callback", "/meta/status", "/meta/teste", "/meta/webhook", "/meta/demo",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -1508,6 +1508,42 @@ async def meta_teste(request: Request) -> JSONResponse:
                 out["amostra_comentarios"] = [{"user": c.get("username"), "text": (c.get("text") or "")[:60]} for c in cs]
         except Exception as e:
             out["posts_erro"] = str(e)[:200]
+        return out
+    res = await anyio.to_thread.run_sync(_run)
+    return JSONResponse(res)
+
+
+@mcp.custom_route("/meta/demo", methods=["GET"])
+async def meta_demo(request: Request) -> JSONResponse:
+    """Demonstração (read-only): comentários reais de um post + conversas de DM (IG e Messenger)."""
+    def _run():
+        out: dict = {}
+        d = _meta_load()
+        if not d or not d.get("ig_id"):
+            return {"erro": "não conectado"}
+        ig, pid = d["ig_id"], d["page_id"]
+        try:
+            posts = _meta_get(f"{ig}/media", {"fields": "id,caption,comments_count", "limit": 15}).get("data", [])
+            alvo = next((p for p in posts if (p.get("comments_count") or 0) > 0), None)
+            if alvo:
+                cs = _meta_get(f"{alvo['id']}/comments", {"fields": "text,username,timestamp,like_count", "limit": 10}).get("data", [])
+                out["comentarios"] = {"post_id": alvo["id"],
+                                      "lista": [{"user": c.get("username"), "text": c.get("text"),
+                                                 "likes": c.get("like_count"), "data": (c.get("timestamp") or "")[:10]} for c in cs]}
+            else:
+                out["comentarios"] = "nenhum post com comentários"
+        except Exception as e:
+            out["comentarios_erro"] = str(e)[:200]
+        for plat, key in [("instagram", "dms_instagram"), ("messenger", "dms_messenger")]:
+            try:
+                convs = _meta_get(f"{pid}/conversations", {"platform": plat,
+                    "fields": "participants,updated_time,snippet", "limit": 10}).get("data", [])
+                out[key] = [{"id": c["id"], "atualizado": (c.get("updated_time") or "")[:16],
+                             "snippet": (c.get("snippet") or "")[:60],
+                             "participantes": [p.get("username") or p.get("name") or p.get("id")
+                                               for p in (c.get("participants", {}) or {}).get("data", [])]} for c in convs]
+            except Exception as e:
+                out[key + "_erro"] = str(e)[:200]
         return out
     res = await anyio.to_thread.run_sync(_run)
     return JSONResponse(res)
