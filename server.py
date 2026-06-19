@@ -622,7 +622,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v16 - bling oauth callback tolerante a restart", status_code=200)
+    return HTMLResponse("v17 - sync bling com desconto/frete", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -781,6 +781,9 @@ async def sync_pedido_bling(request: Request) -> JSONResponse:
         wc_order_id = body.get("wc_order_id")
         billing     = body.get("billing", {})
         items       = body.get("items", [])
+        discount    = float(body.get("discount", 0) or 0)
+        shipping    = float(body.get("shipping", 0) or 0)
+        coupon      = body.get("coupon", "") or ""
 
         if not wc_order_id or not items:
             return JSONResponse({"error": "wc_order_id e items são obrigatórios"}, status_code=400)
@@ -807,13 +810,28 @@ async def sync_pedido_bling(request: Request) -> JSONResponse:
                     bi["descricao"] = item.get("name", "Produto")
                 bling_items.append(bi)
 
-            pedido = _bling_post("/pedidos/vendas", {
+            obs = f"Pedido via site novo (WC #{wc_order_id})"
+            if coupon:
+                obs += f" | Cupom: {coupon}"
+            if shipping:
+                obs += f" | Frete: R$ {shipping:.2f}"
+
+            payload: dict = {
                 "contato":             {"id": contact_id},
                 "data":                date.today().isoformat(),
                 "itens":               bling_items,
                 "numeroPedidoCompra":  str(wc_order_id),
-                "observacoes":         f"Pedido via site novo (WC #{wc_order_id})",
-            }).get("data", {})
+                "observacoes":         obs,
+            }
+            # Desconto do cupom: itens vão a preço cheio e o abatimento entra aqui,
+            # para o total do Bling bater com o total pago no site.
+            if discount > 0:
+                payload["desconto"] = {"valor": round(discount, 2), "unidade": "REAL"}
+            # Frete (quando houver): reflete no transporte do pedido Bling
+            if shipping > 0:
+                payload["transporte"] = {"frete": round(shipping, 2)}
+
+            pedido = _bling_post("/pedidos/vendas", payload).get("data", {})
             return pedido.get("id")
 
         bling_order_id = await anyio.to_thread.run_sync(_run)
