@@ -69,7 +69,7 @@ _users_by_token, _users_by_id = _load_users()
 
 _OPEN_PATHS = frozenset({
     "/", "/version", "/bling/callback", "/bling/persist-status", "/health/sistema",
-    "/meta/callback", "/meta/status", "/meta/teste", "/meta/webhook", "/meta/demo",
+    "/meta/callback", "/meta/status", "/meta/teste", "/meta/webhook", "/meta/demo", "/meta/buscar-dm",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -1545,6 +1545,44 @@ async def meta_demo(request: Request) -> JSONResponse:
             except Exception as e:
                 out[key + "_erro"] = str(e)[:200]
         return out
+    res = await anyio.to_thread.run_sync(_run)
+    return JSONResponse(res)
+
+
+@mcp.custom_route("/meta/buscar-dm", methods=["GET"])
+async def meta_buscar_dm(request: Request) -> JSONResponse:
+    """Busca conversas de DM por participante. ?user=marconflpe&plataforma=instagram|facebook"""
+    qp = request.query_params
+    alvo = (qp.get("user") or "").lstrip("@").lower()
+    plat = "instagram" if (qp.get("plataforma", "instagram")).lower().startswith("i") else "messenger"
+
+    def _run():
+        if not alvo:
+            return {"erro": "informe ?user=usuario"}
+        d = _meta_load()
+        if not d or not d.get("page_id"):
+            return {"erro": "não conectado"}
+        try:
+            convs = _meta_get(f"{d['page_id']}/conversations",
+                              {"platform": plat, "fields": "participants,updated_time", "limit": 50}).get("data", [])
+        except Exception as e:
+            return {"erro": str(e)[:220]}
+        achados = []
+        for c in convs:
+            parts = (c.get("participants", {}) or {}).get("data", [])
+            nomes = [(p.get("username") or p.get("name") or "").lower() for p in parts]
+            if any(alvo in n for n in nomes if n):
+                try:
+                    msgs = _meta_get(c["id"], {"fields": "messages.limit(25){message,from,created_time}"}) \
+                        .get("messages", {}).get("data", [])
+                except Exception as e:
+                    achados.append({"conversa_id": c["id"], "erro_msgs": str(e)[:160]})
+                    continue
+                achados.append({"conversa_id": c["id"],
+                                "mensagens": [{"de": m.get("from", {}).get("username") or m.get("from", {}).get("name"),
+                                               "texto": m.get("message"),
+                                               "quando": (m.get("created_time") or "")[:16]} for m in reversed(msgs)]})
+        return {"plataforma": plat, "busca": alvo, "resultados": achados or "nenhuma conversa com esse usuário"}
     res = await anyio.to_thread.run_sync(_run)
     return JSONResponse(res)
 
