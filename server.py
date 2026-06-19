@@ -69,6 +69,7 @@ _users_by_token, _users_by_id = _load_users()
 
 _OPEN_PATHS = frozenset({
     "/", "/version", "/bling/callback", "/bling/persist-status", "/health/sistema",
+    "/meta/callback", "/meta/status",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -85,8 +86,8 @@ class _AuthMiddleware:
                 auth = headers.get(b"authorization", b"").decode("latin-1")
                 bearer = auth[7:] if auth.startswith("Bearer ") else ""
 
-                # /bling/auth também aceita ?token= para abrir no browser
-                if not bearer and path == "/bling/auth":
+                # /bling/auth e /meta/auth também aceitam ?token= para abrir no browser
+                if not bearer and path in ("/bling/auth", "/meta/auth"):
                     import urllib.parse
                     qs = scope.get("query_string", b"").decode()
                     bearer = dict(urllib.parse.parse_qsl(qs)).get("token", "")
@@ -768,7 +769,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v22 - planilhas via Apps Script Web App (sem service account)", status_code=200)
+    return HTMLResponse("v23 - Meta (Instagram) OAuth + metricas + comentarios", status_code=200)
 
 
 @mcp.custom_route("/health/sistema", methods=["GET"])
@@ -1261,6 +1262,288 @@ def criar_pedido_venda_bling(id_contato: int, itens: list, numero_pedido_externo
         f"✓ Pedido de venda #{pedido.get('id', '?')} criado no Bling! | "
         f"Referência WooCommerce: {numero_pedido_externo or '-'}"
     )
+
+
+# ── Meta (Instagram + Facebook) — OAuth, métricas e comentários ───────────────
+# Autenticação via Facebook Login: um token de Página (longa duração, não expira)
+# dá acesso à Página E à conta Instagram conectada (@vienna.pet). Persistimos o
+# token nas env vars do Railway (sobrevive a restart, como o Bling).
+
+META_APP_ID       = os.environ.get("META_APP_ID", "2433360223843927")
+META_APP_SECRET   = os.environ.get("META_APP_SECRET", "")
+META_REDIRECT_URI = os.environ.get("META_REDIRECT_URI", f"{_BASE_URL}/meta/callback")
+META_GRAPH        = "https://graph.facebook.com/v21.0"
+META_SCOPES = ",".join([
+    "pages_show_list", "pages_read_engagement", "pages_manage_engagement",
+    "pages_manage_metadata", "pages_messaging", "pages_read_user_content", "read_insights",
+    "instagram_basic", "instagram_manage_insights", "instagram_manage_comments",
+    "instagram_manage_messages", "business_management",
+])
+
+_meta_cache: dict | None = None
+
+
+def _railway_upsert_var(name: str, value: str) -> bool:
+    """Grava uma env var no próprio serviço Railway (genérico). Usado p/ persistir
+    os tokens Meta entre restarts (disco efêmero)."""
+    api_token      = os.environ.get("RAILWAY_API_TOKEN", "")
+    project_id     = os.environ.get("RAILWAY_PROJECT_ID", "")
+    environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+    service_id     = os.environ.get("RAILWAY_SERVICE_ID", "")
+    if not all([api_token, project_id, environment_id, service_id]) or value is None:
+        return False
+    query = "mutation variableUpsert($input: VariableUpsertInput!) { variableUpsert(input: $input) }"
+    variables = {"input": {"projectId": project_id, "environmentId": environment_id,
+                           "serviceId": service_id, "name": name, "value": value}}
+    try:
+        resp = requests.post("https://backboard.railway.app/graphql/v2",
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+            json={"query": query, "variables": variables}, timeout=10)
+        resp.raise_for_status()
+        return not resp.json().get("errors")
+    except Exception as e:
+        print(f"[railway] upsert {name} erro: {e}")
+        return False
+
+
+def _meta_load() -> dict | None:
+    global _meta_cache
+    if _meta_cache:
+        return _meta_cache
+    tok = os.environ.get("META_PAGE_TOKEN", "")
+    if tok:
+        _meta_cache = {
+            "page_token": tok,
+            "page_id":   os.environ.get("META_PAGE_ID", ""),
+            "ig_id":     os.environ.get("META_IG_ID", ""),
+            "page_name": os.environ.get("META_PAGE_NAME", ""),
+        }
+        return _meta_cache
+    return None
+
+
+def _meta_save(data: dict) -> None:
+    global _meta_cache
+    _meta_cache = data
+    for key, env in [("page_token", "META_PAGE_TOKEN"), ("page_id", "META_PAGE_ID"),
+                     ("ig_id", "META_IG_ID"), ("page_name", "META_PAGE_NAME")]:
+        _railway_upsert_var(env, data.get(key, "") or "")
+
+
+def _meta_require() -> dict:
+    d = _meta_load()
+    if not d or not d.get("page_token"):
+        raise RuntimeError("Meta não conectado. Abra /meta/auth?token=SEU_MCP_AUTH_TOKEN no navegador e autorize.")
+    return d
+
+
+def _meta_get(path: str, params: dict | None = None) -> dict:
+    d = _meta_require()
+    p = dict(params or {}); p["access_token"] = d["page_token"]
+    r = requests.get(f"{META_GRAPH}/{path}", params=p, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Meta API {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def _meta_post(path: str, data: dict) -> dict:
+    d = _meta_require()
+    payload = dict(data); payload["access_token"] = d["page_token"]
+    r = requests.post(f"{META_GRAPH}/{path}", data=payload, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Meta API {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+@mcp.custom_route("/meta/auth", methods=["GET"])
+async def meta_auth(request: Request) -> HTMLResponse:
+    if not META_APP_SECRET:
+        return HTMLResponse("Configure META_APP_SECRET no Railway antes de autenticar.", status_code=400)
+    state = secrets.token_urlsafe(16)
+    _bling_pending_state[state] = "meta"
+    url = (f"https://www.facebook.com/v21.0/dialog/oauth?client_id={META_APP_ID}"
+           f"&redirect_uri={META_REDIRECT_URI}&response_type=code&state={state}&scope={META_SCOPES}")
+    return RedirectResponse(url)
+
+
+@mcp.custom_route("/meta/callback", methods=["GET"])
+async def meta_callback(request: Request) -> HTMLResponse:
+    code = request.query_params.get("code")
+    err  = request.query_params.get("error_description")
+    if err:
+        return HTMLResponse(f"<h2>Erro Meta:</h2><p>{err}</p>", status_code=400)
+    if not code:
+        return HTMLResponse("<h2>Erro: code não recebido.</h2>", status_code=400)
+
+    def _exchange():
+        r = requests.get(f"{META_GRAPH}/oauth/access_token", params={
+            "client_id": META_APP_ID, "redirect_uri": META_REDIRECT_URI,
+            "client_secret": META_APP_SECRET, "code": code}, timeout=30)
+        r.raise_for_status()
+        short = r.json()["access_token"]
+        r2 = requests.get(f"{META_GRAPH}/oauth/access_token", params={
+            "grant_type": "fb_exchange_token", "client_id": META_APP_ID,
+            "client_secret": META_APP_SECRET, "fb_exchange_token": short}, timeout=30)
+        r2.raise_for_status()
+        longtok = r2.json()["access_token"]
+        r3 = requests.get(f"{META_GRAPH}/me/accounts", params={
+            "fields": "id,name,access_token,instagram_business_account",
+            "access_token": longtok, "limit": 100}, timeout=30)
+        r3.raise_for_status()
+        pages = r3.json().get("data", [])
+        if not pages:
+            raise RuntimeError("Nenhuma Página encontrada para este usuário.")
+        page = next((p for p in pages if p.get("instagram_business_account")), pages[0])
+        ig = (page.get("instagram_business_account") or {}).get("id", "")
+        return {"page_token": page["access_token"], "page_id": page["id"],
+                "ig_id": ig, "page_name": page.get("name", "")}
+
+    try:
+        data = await anyio.to_thread.run_sync(_exchange)
+    except Exception as e:
+        return HTMLResponse(f"<h2>Erro ao conectar Meta:</h2><pre>{str(e)[:500]}</pre>", status_code=500)
+
+    _meta_save(data)
+    ig_msg = (f"Instagram conectado: {data['ig_id']}" if data["ig_id"]
+              else "⚠️ Página sem Instagram Business vinculado — conecte a @vienna.pet à Página e refaça.")
+    return HTMLResponse(
+        "<body style='font-family:sans-serif;max-width:600px;margin:40px auto'>"
+        "<h2 style='color:green'>Meta conectado com sucesso!</h2>"
+        f"<p>Página: <b>{data['page_name']}</b> (id {data['page_id']})</p>"
+        f"<p>{ig_msg}</p><p>Pode fechar esta aba.</p></body>")
+
+
+@mcp.custom_route("/meta/status", methods=["GET"])
+async def meta_status(request: Request) -> JSONResponse:
+    d = _meta_load()
+    return JSONResponse({
+        "conectado":              bool(d and d.get("page_token")),
+        "page_name":              (d or {}).get("page_name", ""),
+        "page_id":                (d or {}).get("page_id", ""),
+        "ig_id":                  (d or {}).get("ig_id", ""),
+        "META_APP_SECRET_present": bool(META_APP_SECRET),
+    })
+
+
+# ── Meta Tools (Instagram) ────────────────────────────────────────────────────
+
+@mcp.tool()
+def meta_conexao_status() -> str:
+    """Mostra se a conta Meta (Página + Instagram) está conectada no MCP."""
+    d = _meta_load()
+    if not d or not d.get("page_token"):
+        return ("❌ Meta NÃO conectado. Abra no navegador:\n"
+                f"{_BASE_URL}/meta/auth?token=SEU_MCP_AUTH_TOKEN\ne autorize com a conta que administra a Página.")
+    return (f"✅ Conectado | Página: {d.get('page_name')} (id {d.get('page_id')}) | "
+            f"Instagram: {d.get('ig_id') or 'NÃO vinculado'}")
+
+
+@mcp.tool()
+def instagram_resumo() -> str:
+    """Resumo da conta Instagram @vienna.pet: usuário, seguidores, total de posts."""
+    d = _meta_require()
+    ig = d.get("ig_id")
+    if not ig:
+        return "Instagram não vinculado à Página. Refaça /meta/auth após conectar a @vienna.pet à Página."
+    info = _meta_get(ig, {"fields": "username,name,followers_count,follows_count,media_count,biography"})
+    return (f"**@{info.get('username','?')}** ({info.get('name','')})\n"
+            f"- Seguidores: {info.get('followers_count','?')}\n"
+            f"- Seguindo: {info.get('follows_count','?')}\n"
+            f"- Posts: {info.get('media_count','?')}")
+
+
+@mcp.tool()
+def instagram_posts(limite: int = 10) -> str:
+    """Lista os posts mais recentes do Instagram com engajamento (curtidas, comentários)."""
+    d = _meta_require()
+    ig = d.get("ig_id")
+    if not ig:
+        return "Instagram não vinculado à Página."
+    data = _meta_get(f"{ig}/media", {
+        "fields": "id,caption,media_type,permalink,timestamp,like_count,comments_count",
+        "limit": min(limite, 50)})
+    posts = data.get("data", [])
+    if not posts:
+        return "Nenhum post encontrado."
+    linhas = []
+    for p in posts:
+        cap = (p.get("caption") or "").replace("\n", " ")[:60]
+        linhas.append(
+            f"- [{p['id']}] {p.get('timestamp','')[:10]} | {p.get('media_type','')} | "
+            f"❤️ {p.get('like_count','?')} 💬 {p.get('comments_count','?')} | {cap}\n  {p.get('permalink','')}")
+    return f"**{len(posts)} post(s) recentes:**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def instagram_metricas(post_id: str = "", periodo_dias: int = 30) -> str:
+    """Métricas de engajamento do Instagram. Sem post_id: resumo da conta + engajamento
+    agregado dos posts recentes. Com post_id: métricas daquele post (alcance, salvos, etc.)."""
+    d = _meta_require()
+    ig = d.get("ig_id")
+    if not ig:
+        return "Instagram não vinculado à Página."
+
+    if post_id:
+        try:
+            ins = _meta_get(f"{post_id}/insights", {"metric": "reach,saved,likes,comments,shares,total_interactions"})
+            vals = {m["name"]: (m.get("values", [{}])[0].get("value") if m.get("values") else m.get("total_value", {}).get("value"))
+                    for m in ins.get("data", [])}
+            return ("**Métricas do post " + post_id + ":**\n" +
+                    "\n".join(f"- {k}: {v}" for k, v in vals.items()))
+        except Exception as e:
+            return f"Erro ao buscar métricas do post: {e}"
+
+    # Conta: seguidores + engajamento agregado dos posts recentes
+    info = _meta_get(ig, {"fields": "username,followers_count,media_count"})
+    media = _meta_get(f"{ig}/media", {"fields": "like_count,comments_count", "limit": 25}).get("data", [])
+    likes = sum(int(p.get("like_count", 0) or 0) for p in media)
+    coms  = sum(int(p.get("comments_count", 0) or 0) for p in media)
+    n = len(media) or 1
+    out = [f"**@{info.get('username','?')}** — {info.get('followers_count','?')} seguidores, {info.get('media_count','?')} posts",
+           f"Engajamento nos últimos {len(media)} posts: ❤️ {likes} curtidas, 💬 {coms} comentários",
+           f"Média por post: {likes/n:.1f} curtidas, {coms/n:.1f} comentários"]
+    # Alcance da conta (best-effort — nomes de métrica variam por versão)
+    try:
+        import time as _t
+        until = int(_t.time()); since = until - periodo_dias * 86400
+        rch = _meta_get(f"{ig}/insights", {"metric": "reach", "period": "day", "since": since, "until": until})
+        total_reach = sum(v.get("value", 0) for m in rch.get("data", []) for v in m.get("values", []))
+        out.append(f"Alcance (~{periodo_dias}d): {total_reach}")
+    except Exception:
+        pass
+    return "\n".join(out)
+
+
+@mcp.tool()
+def instagram_comentarios(post_id: str, limite: int = 30) -> str:
+    """Lista os comentários de um post do Instagram (use o id vindo de instagram_posts)."""
+    d = _meta_require()
+    data = _meta_get(f"{post_id}/comments", {
+        "fields": "id,text,username,timestamp,like_count", "limit": min(limite, 50)})
+    coms = data.get("data", [])
+    if not coms:
+        return "Nenhum comentário neste post."
+    linhas = [f"- [{c['id']}] @{c.get('username','?')} ({c.get('timestamp','')[:10]}): "
+              f"{c.get('text','')} (❤️ {c.get('like_count',0)})" for c in coms]
+    return f"**{len(coms)} comentário(s):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def responder_comentario(comentario_id: str, mensagem: str) -> str:
+    """Responde a um comentário do Instagram."""
+    _require_write()
+    if not comentario_id or not mensagem.strip():
+        return "Erro: informe o id do comentário e a mensagem."
+    res = _meta_post(f"{comentario_id}/replies", {"message": mensagem})
+    return f"✅ Resposta publicada (id {res.get('id','?')}) no comentário {comentario_id}."
+
+
+@mcp.tool()
+def ocultar_comentario(comentario_id: str, ocultar: bool = True) -> str:
+    """Oculta (ou reexibe) um comentário do Instagram. ocultar=True esconde, False reexibe."""
+    _require_write()
+    _meta_post(f"{comentario_id}", {"hide": "true" if ocultar else "false"})
+    return f"✅ Comentário {comentario_id} {'ocultado' if ocultar else 'reexibido'}."
 
 
 # ── Admin API ─────────────────────────────────────────────────────────────────
