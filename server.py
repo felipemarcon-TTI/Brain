@@ -1625,7 +1625,15 @@ async def meta_buscar_dm(request: Request) -> JSONResponse:
                                 "mensagens": [{"de": m.get("from", {}).get("username") or m.get("from", {}).get("name"),
                                                "texto": m.get("message"),
                                                "quando": (m.get("created_time") or "")[:16]} for m in reversed(msgs)]})
-        return {"plataforma": plat, "busca": alvo, "resultados": achados or "nenhuma conversa com esse usuário"}
+        if achados:
+            return {"plataforma": plat, "busca": alvo, "resultados": achados}
+        dump = [{"conversa_id": c["id"], "atualizado": (c.get("updated_time") or "")[:16],
+                 "participantes": [{"id": p.get("id"), "username": p.get("username"), "name": p.get("name")}
+                                   for p in (c.get("participants", {}) or {}).get("data", [])]}
+                for c in convs]
+        return {"plataforma": plat, "busca": alvo,
+                "resultados": "nenhuma conversa com esse usuário",
+                "total_conversas": len(convs), "todas_conversas": dump}
     res = await anyio.to_thread.run_sync(_run)
     return JSONResponse(res)
 
