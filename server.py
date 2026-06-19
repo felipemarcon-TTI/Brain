@@ -769,7 +769,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v23 - Meta (Instagram) OAuth + metricas + comentarios", status_code=200)
+    return HTMLResponse("v24 - Meta scopes validos (IG basic/comments/messages)", status_code=200)
 
 
 @mcp.custom_route("/health/sistema", methods=["GET"])
@@ -1273,11 +1273,13 @@ META_APP_ID       = os.environ.get("META_APP_ID", "2433360223843927")
 META_APP_SECRET   = os.environ.get("META_APP_SECRET", "")
 META_REDIRECT_URI = os.environ.get("META_REDIRECT_URI", f"{_BASE_URL}/meta/callback")
 META_GRAPH        = "https://graph.facebook.com/v21.0"
+# scopes validos hoje no app (os 4 removidos exigem produto/aprovacao extra:
+# pages_manage_engagement, pages_read_user_content, read_insights, instagram_manage_insights;
+# reativamos depois p/ insights profundos do IG e gestao de comentarios do FB)
 META_SCOPES = ",".join([
-    "pages_show_list", "pages_read_engagement", "pages_manage_engagement",
-    "pages_manage_metadata", "pages_messaging", "pages_read_user_content", "read_insights",
-    "instagram_basic", "instagram_manage_insights", "instagram_manage_comments",
-    "instagram_manage_messages", "business_management",
+    "pages_show_list", "pages_read_engagement", "pages_manage_metadata", "pages_messaging",
+    "instagram_basic", "instagram_manage_comments", "instagram_manage_messages",
+    "business_management",
 ])
 
 _meta_cache: dict | None = None
