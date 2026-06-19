@@ -68,7 +68,7 @@ _users_by_token, _users_by_id = _load_users()
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
 _OPEN_PATHS = frozenset({
-    "/", "/version", "/bling/callback", "/bling/persist-status",
+    "/", "/version", "/bling/callback", "/bling/persist-status", "/health/sistema",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -170,6 +170,61 @@ def _wp_post(endpoint: str, data: dict) -> dict:
     resp = requests.post(f"{WC_URL}/wp-json/{endpoint}", auth=_wp_auth(), json=data, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+# ── Google Sheets (planilhas de Cupons e Afiliados) ───────────────────────────
+# A planilha é o REGISTRO. A tool grava nela via Service Account (GOOGLE_SA_JSON).
+# Compartilhe as 2 planilhas com o e-mail do service account (como Editor).
+
+CUPONS_SHEET_ID    = os.environ.get("CUPONS_SHEET_ID", "1RBzTk8hG-bZCfOYnxFFuENifKaGEycMYBVCmLity2bw")
+AFILIADOS_SHEET_ID = os.environ.get("AFILIADOS_SHEET_ID", "1XTRoCdnBjZ2ZZw6ixCuVuBDIOilTTrjW18-F8aDLHfM")
+
+_CUPONS_HEADER    = ["Código do Cupom", "Data de Validade", "Desconto (%)", "@ Dono do Cupom", "Observação"]
+_AFILIADOS_HEADER = ["@ da Pessoa", "URL do Link"]
+
+
+def _gspread_ws(sheet_id: str, header: list[str]):
+    """Abre a primeira aba da planilha e garante o cabeçalho. Requer GOOGLE_SA_JSON."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    raw = os.environ.get("GOOGLE_SA_JSON", "")
+    if not raw:
+        raise RuntimeError("GOOGLE_SA_JSON não configurado no Railway (Service Account).")
+    info = json.loads(raw)
+    creds = Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    ws = gspread.authorize(creds).open_by_key(sheet_id).sheet1
+    # Normaliza o cabeçalho (idempotente)
+    first = ws.row_values(1)
+    if [c.strip() for c in first][: len(header)] != header:
+        ws.update(f"A1:{chr(64 + len(header))}1", [header])
+    return ws
+
+
+def _sheet_append_cupom(row: list) -> None:
+    ws = _gspread_ws(CUPONS_SHEET_ID, _CUPONS_HEADER)
+    ws.append_row([str(c) for c in row], value_input_option="USER_ENTERED")
+
+
+def _sheet_append_afiliado(row: list) -> None:
+    ws = _gspread_ws(AFILIADOS_SHEET_ID, _AFILIADOS_HEADER)
+    ws.append_row([str(c) for c in row], value_input_option="USER_ENTERED")
+
+
+def _sheet_revogar_cupom(codigo: str, nova_validade: str, observacao: str) -> bool:
+    """Acha a linha do cupom (col A) e atualiza Validade (col B) e Observação (col E)."""
+    ws = _gspread_ws(CUPONS_SHEET_ID, _CUPONS_HEADER)
+    try:
+        cell = ws.find(codigo)
+    except Exception:
+        cell = None
+    if not cell:
+        return False
+    ws.update_cell(cell.row, 2, nova_validade)   # B = Validade
+    ws.update_cell(cell.row, 5, observacao)       # E = Observação
+    return True
 
 
 # ── Bling helpers ─────────────────────────────────────────────────────────────
@@ -379,6 +434,110 @@ def _bling_find_product_by_sku(sku: str) -> int | None:
     except Exception:
         pass
     return None
+
+
+# ── Cupons & Afiliados (criam no WooCommerce + registram na planilha) ─────────
+
+@mcp.tool()
+def criar_cupom(codigo: str, data_validade: str, desconto_percentual: float, dono_arroba: str) -> str:
+    """Cria um cupom de desconto no WooCommerce e registra na planilha de Cupons.
+    TODOS os campos são obrigatórios.
+
+    codigo: código do cupom (ex.: PRIMEIRA10)
+    data_validade: data de expiração no formato AAAA-MM-DD (ex.: 2026-12-31)
+    desconto_percentual: porcentagem de desconto (ex.: 10 para 10%)
+    dono_arroba: @ da pessoa dona do cupom (ex.: @joao) — usado para creditar o afiliado
+    """
+    _require_write()
+    codigo = (codigo or "").strip()
+    data_validade = (data_validade or "").strip()
+    dono_arroba = (dono_arroba or "").strip()
+    if not codigo or not data_validade or not desconto_percentual or not dono_arroba:
+        return "Erro: todos os campos são obrigatórios (codigo, data_validade, desconto_percentual, dono_arroba)."
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", data_validade):
+        return "Erro: data_validade deve estar no formato AAAA-MM-DD."
+    if not dono_arroba.startswith("@"):
+        dono_arroba = "@" + dono_arroba
+
+    # 1) cria no WooCommerce (token [afiliado:@x] na descrição credita o dono na venda)
+    try:
+        novo = _wc_post("coupons", {
+            "code": codigo,
+            "discount_type": "percent",
+            "amount": str(desconto_percentual),
+            "date_expires": data_validade,
+            "description": f"[afiliado:{dono_arroba}]",
+            "individual_use": False,
+        })
+    except Exception as e:
+        return f"Erro ao criar cupom no WooCommerce: {e}"
+    wc_id = novo.get("id")
+
+    # 2) registra na planilha
+    try:
+        _sheet_append_cupom([codigo, data_validade, desconto_percentual, dono_arroba, ""])
+        reg = "registrado na planilha"
+    except Exception as e:
+        reg = f"⚠️ criado no WC (#{wc_id}) mas FALHOU registrar na planilha: {e}"
+
+    return (
+        f"✅ Cupom **{codigo}** criado no WooCommerce (#{wc_id}): "
+        f"{desconto_percentual}% até {data_validade}, dono {dono_arroba}. {reg}."
+    )
+
+
+@mcp.tool()
+def revogar_cupom(codigo: str, motivo: str = "") -> str:
+    """Revoga um cupom: muda a validade para hoje no WooCommerce (expira imediatamente)
+    e anota na planilha (validade + observação 'REVOGADO').
+
+    codigo: código do cupom a revogar
+    motivo: (opcional) motivo da revogação
+    """
+    _require_write()
+    codigo = (codigo or "").strip()
+    if not codigo:
+        return "Erro: informe o código do cupom."
+    encontrados = _wc_get("coupons", {"code": codigo})
+    if not encontrados or not isinstance(encontrados, list):
+        return f"Cupom '{codigo}' não encontrado no WooCommerce."
+    cid = encontrados[0]["id"]
+    hoje = date.today().isoformat()
+    try:
+        _wc_put(f"coupons/{cid}", {"date_expires": hoje})
+    except Exception as e:
+        return f"Erro ao revogar no WooCommerce: {e}"
+
+    obs = f"REVOGADO em {hoje}" + (f" — {motivo}" if motivo else "")
+    try:
+        ok = _sheet_revogar_cupom(codigo, hoje, obs)
+        reg = "planilha atualizada" if ok else "⚠️ não achei a linha na planilha (atualize manualmente)"
+    except Exception as e:
+        reg = f"⚠️ revogado no WC mas falhou atualizar planilha: {e}"
+
+    return f"✅ Cupom **{codigo}** revogado (expira em {hoje}). {reg}."
+
+
+@mcp.tool()
+def criar_afiliado(arroba: str) -> str:
+    """Gera o link de afiliado (UTM) e registra na planilha de Afiliados. NÃO expira.
+
+    arroba: @ da pessoa (ex.: @joao)
+    """
+    _require_write()
+    arroba = (arroba or "").strip()
+    if not arroba:
+        return "Erro: informe o @ da pessoa."
+    if not arroba.startswith("@"):
+        arroba = "@" + arroba
+    handle = arroba.lstrip("@")
+    url = f"https://www.viennapet.com.br/?utm_source={handle}&utm_medium=affiliate&utm_campaign=afiliados"
+    try:
+        _sheet_append_afiliado([arroba, url])
+        reg = "registrado na planilha"
+    except Exception as e:
+        reg = f"⚠️ link gerado mas FALHOU registrar na planilha: {e}"
+    return f"✅ Afiliado **{arroba}** — link: {url}. {reg}."
 
 
 # ── WooCommerce Tools ─────────────────────────────────────────────────────────
@@ -628,7 +787,53 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v20 - atribuicao afiliado/utm em observacoesInternas", status_code=200)
+    return HTMLResponse("v21 - tools criar_cupom/criar_afiliado/revogar_cupom + /health/sistema", status_code=200)
+
+
+@mcp.custom_route("/health/sistema", methods=["GET"])
+async def health_sistema(request: Request) -> JSONResponse:
+    """Health check de ponta a ponta (público, sem segredos): WooCommerce, Bling,
+    frete (Store API), planilhas (Service Account) e site. Evita reprocessar tudo
+    manualmente — uma chamada valida o sistema inteiro."""
+    def _run():
+        out: dict = {}
+        try:
+            p = _wc_get("products", {"per_page": 1})
+            out["woocommerce"] = "ok" if isinstance(p, list) else "falha"
+        except Exception as e:
+            out["woocommerce"] = f"erro: {str(e)[:80]}"
+        try:
+            d = _bling_get("/contatos", {"limite": 1})
+            out["bling"] = "ok" if isinstance(d, dict) and d.get("data") is not None else "falha"
+        except Exception as e:
+            out["bling"] = f"erro: {str(e)[:80]}"
+        try:
+            r = requests.post(
+                "https://www.viennapet.com.br/api/calcular-frete",
+                json={"postcode": "01310100", "items": [{"id": 282, "quantity": 1}]},
+                timeout=20,
+            )
+            rates = r.json() if r.ok else []
+            paid = [x for x in rates if float(x.get("cost", 0) or 0) > 0]
+            out["frete"] = f"ok ({len(rates)} opções)" if paid else "falha (sem taxa paga)"
+        except Exception as e:
+            out["frete"] = f"erro: {str(e)[:80]}"
+        try:
+            _gspread_ws(CUPONS_SHEET_ID, _CUPONS_HEADER)
+            _gspread_ws(AFILIADOS_SHEET_ID, _AFILIADOS_HEADER)
+            out["planilhas"] = "ok"
+        except Exception as e:
+            out["planilhas"] = f"erro: {str(e)[:80]}"
+        try:
+            s = requests.get("https://www.viennapet.com.br/", timeout=15)
+            out["site"] = "ok" if s.status_code == 200 else f"http {s.status_code}"
+        except Exception as e:
+            out["site"] = f"erro: {str(e)[:80]}"
+        return out
+
+    checks = await anyio.to_thread.run_sync(_run)
+    all_ok = all(str(v).startswith("ok") for v in checks.values())
+    return JSONResponse({"status": "ok" if all_ok else "atencao", "checks": checks})
 
 
 @mcp.custom_route("/bling/persist-status", methods=["GET"])
