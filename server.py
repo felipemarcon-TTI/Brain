@@ -470,6 +470,48 @@ def criar_cupom(codigo: str, data_validade: str, desconto_percentual: float, don
 
 
 @mcp.tool()
+def criar_cupom_simples(codigo: str, desconto_percentual: float, frete_gratis: bool = True,
+                        uso_unico: bool = True, data_validade: str = "") -> str:
+    """Cria um cupom de desconto simples no WooCommerce, SEM registrar na planilha de
+    afiliados (para testes/promoções pontuais).
+    - desconto_percentual: % de desconto (ex.: 50 para 50%)
+    - frete_gratis: se True, marca free_shipping no cupom (o checkout do site novo zera o
+      frete quando o cupom tem free_shipping=true)
+    - uso_unico: se True, limita o cupom a 1 uso (usage_limit=1)
+    - data_validade: opcional, formato AAAA-MM-DD
+    """
+    _require_write()
+    codigo = (codigo or "").strip()
+    if not codigo or not desconto_percentual:
+        return "Erro: codigo e desconto_percentual são obrigatórios."
+    if data_validade and not re.match(r"^\d{4}-\d{2}-\d{2}$", data_validade):
+        return "Erro: data_validade deve estar no formato AAAA-MM-DD."
+    body: dict = {
+        "code":           codigo,
+        "discount_type":  "percent",
+        "amount":         str(desconto_percentual),
+        "free_shipping":  bool(frete_gratis),
+        "individual_use": True,
+        "description":    "Cupom simples (MCP) - sem afiliado",
+    }
+    if uso_unico:
+        body["usage_limit"] = 1
+    if data_validade:
+        body["date_expires"] = data_validade
+    try:
+        novo = _wc_post("coupons", body)
+    except Exception as e:
+        return f"Erro ao criar cupom no WooCommerce: {e}"
+    return (
+        f"✅ Cupom **{codigo}** criado no WooCommerce (#{novo.get('id')}): "
+        f"{desconto_percentual:g}% off"
+        f"{' | frete grátis' if frete_gratis else ''}"
+        f"{' | uso único' if uso_unico else ''}"
+        f"{' | expira ' + data_validade if data_validade else ''}."
+    )
+
+
+@mcp.tool()
 def revogar_cupom(codigo: str, motivo: str = "") -> str:
     """Revoga um cupom: muda a validade para hoje no WooCommerce (expira imediatamente)
     e anota na planilha (validade + observação 'REVOGADO').
@@ -770,7 +812,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v26 - buscar_pedido_venda_bling (detalhe completo de pedido no Bling)", status_code=200)
+    return HTMLResponse("v27 - criar_cupom_simples (cupom teste: free_shipping + uso unico, sem planilha)", status_code=200)
 
 
 @mcp.custom_route("/health/sistema", methods=["GET"])
