@@ -22,6 +22,12 @@ WC_CONSUMER_SECRET = os.environ.get("WC_CONSUMER_SECRET", "")
 WP_USER            = os.environ.get("WP_USER", "")
 WP_PASS            = os.environ.get("WP_PASS", "")
 
+# Kill-switch de ESCRITA no WooCommerce (cobre criar/atualizar via _wc_post/_wc_put:
+# cupons, produtos, variações, pedidos, status). DESLIGADO por decisão em 2026-06-20.
+# Leituras (_wc_get/_wc_get_all) seguem normais. Escritas no WordPress (_wp_post) NÃO são afetadas.
+# Para REATIVAR: defina a env var WC_WRITES_ENABLED=true no Railway (default abaixo = desligado).
+WC_WRITES_ENABLED = os.environ.get("WC_WRITES_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
 BLING_CLIENT_ID     = os.environ.get("BLING_CLIENT_ID", "")
 BLING_CLIENT_SECRET = os.environ.get("BLING_CLIENT_SECRET", "")
 BLING_BASE_URL      = "https://www.bling.com.br/Api/v3"
@@ -135,12 +141,22 @@ def _wc_get(endpoint: str, params: dict | None = None) -> dict | list:
     resp.raise_for_status()
     return resp.json()
 
+def _wc_assert_writes_enabled():
+    """Kill-switch: bloqueia qualquer escrita no WooCommerce quando WC_WRITES_ENABLED=false."""
+    if not WC_WRITES_ENABLED:
+        raise RuntimeError(
+            "escrita no WooCommerce DESABILITADA (flag WC_WRITES_ENABLED=false). "
+            "Nenhuma alteração foi feita. Para reativar, defina WC_WRITES_ENABLED=true no Railway."
+        )
+
 def _wc_put(endpoint: str, data: dict) -> dict:
+    _wc_assert_writes_enabled()
     resp = requests.put(f"{WC_URL}/wp-json/wc/v3/{endpoint}", auth=_wc_auth(), json=data, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 def _wc_post(endpoint: str, data: dict) -> dict:
+    _wc_assert_writes_enabled()
     resp = requests.post(f"{WC_URL}/wp-json/wc/v3/{endpoint}", auth=_wc_auth(), json=data, timeout=30)
     resp.raise_for_status()
     return resp.json()
@@ -922,7 +938,13 @@ async def health_sistema(request: Request) -> JSONResponse:
 
     checks = await anyio.to_thread.run_sync(_run)
     all_ok = all(str(v).startswith("ok") for v in checks.values())
-    return JSONResponse({"status": "ok" if all_ok else "atencao", "checks": checks})
+    # Estado do kill-switch de escrita do WC fica FORA de `checks` (não conta como falha:
+    # escrita desabilitada é intencional). Apenas informativo/verificável.
+    return JSONResponse({
+        "status": "ok" if all_ok else "atencao",
+        "checks": checks,
+        "woocommerce_writes": "habilitada" if WC_WRITES_ENABLED else "DESABILITADA (flag WC_WRITES_ENABLED=false)",
+    })
 
 
 @mcp.custom_route("/bling/persist-status", methods=["GET"])
