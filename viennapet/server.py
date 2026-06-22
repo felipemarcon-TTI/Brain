@@ -945,6 +945,7 @@ async def health_sistema(request: Request) -> JSONResponse:
         "checks": checks,
         "woocommerce_writes": "habilitada" if WC_WRITES_ENABLED else "DESABILITADA (flag WC_WRITES_ENABLED=false)",
         "ads_writes": "habilitada" if ADS_WRITES_ENABLED else "DESABILITADA (flag ADS_WRITES_ENABLED=false)",
+        "posts_writes": "habilitada" if POSTS_WRITES_ENABLED else "DESABILITADA (flag POSTS_WRITES_ENABLED=false)",
     })
 
 
@@ -1477,11 +1478,17 @@ META_SCOPES = ",".join([
     "business_management",
     # Ads (Meta Marketing API) — leitura e gestão de campanhas
     "ads_read", "ads_management",
+    # Publicação de conteúdo (post no IG/FB) — exige liberar no painel do App + reautenticar
+    "instagram_content_publish", "pages_manage_posts",
 ])
 
 # Kill-switch de escrita em Ads (espelha WC_WRITES_ENABLED). Default = desligado para
 # evitar pausar/ativar campanha por engano. Reative com ADS_WRITES_ENABLED=true no Railway.
 ADS_WRITES_ENABLED = os.environ.get("ADS_WRITES_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# Kill-switch de PUBLICAÇÃO de posts (IG/FB). Default = desligado: as tools existem mas
+# NÃO publicam nada até POSTS_WRITES_ENABLED=true no Railway. Evita post acidental.
+POSTS_WRITES_ENABLED = os.environ.get("POSTS_WRITES_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 _meta_cache: dict | None = None
 META_WEBHOOK_VERIFY_TOKEN = os.environ.get("META_WEBHOOK_VERIFY_TOKEN", "")
@@ -1604,6 +1611,14 @@ def _ads_assert_writes_enabled():
         raise RuntimeError(
             "escrita em Ads DESABILITADA (flag ADS_WRITES_ENABLED=false). "
             "Nenhuma campanha foi alterada. Para reativar, defina ADS_WRITES_ENABLED=true no Railway.")
+
+
+def _posts_assert_writes_enabled():
+    """Kill-switch: bloqueia PUBLICAÇÃO de posts (IG/FB) quando POSTS_WRITES_ENABLED=false."""
+    if not POSTS_WRITES_ENABLED:
+        raise RuntimeError(
+            "publicação DESABILITADA (flag POSTS_WRITES_ENABLED=false). "
+            "Nada foi publicado. Para liberar, defina POSTS_WRITES_ENABLED=true no Railway.")
 
 
 @mcp.custom_route("/meta/auth", methods=["GET"])
@@ -2209,6 +2224,86 @@ def ads_ativar(entity_id: str) -> str:
         return "Erro: informe o id da campanha/conjunto/anúncio."
     _meta_ads_post(entity_id.strip(), {"status": "ACTIVE"})
     return f"✅ {entity_id} ativado (status=ACTIVE)."
+
+
+@mcp.tool()
+def ads_criar_campanha(nome: str, objetivo: str = "OUTCOME_TRAFFIC", orcamento_diario_reais: float = 0.0) -> str:
+    """Cria uma campanha de Ads em status PAUSED (NÃO gasta até você ativar com ads_ativar).
+    objetivo: OUTCOME_TRAFFIC, OUTCOME_SALES, OUTCOME_ENGAGEMENT, OUTCOME_LEADS, OUTCOME_AWARENESS,
+    OUTCOME_APP_PROMOTION. orcamento_diario_reais: orçamento diário no nível da campanha (CBO), opcional.
+    Requer ADS_WRITES_ENABLED=true."""
+    _require_write()
+    _ads_assert_writes_enabled()
+    if not nome.strip():
+        return "Erro: informe o nome da campanha."
+    d = _meta_ads_require()
+    body = {
+        "name": nome.strip(),
+        "objective": objetivo.strip().upper(),
+        "status": "PAUSED",
+        "special_ad_categories": json.dumps([]),
+    }
+    if orcamento_diario_reais > 0:
+        body["daily_budget"] = int(round(orcamento_diario_reais * 100))  # Meta usa centavos
+    res = _meta_ads_post(f"{d['ad_account_id']}/campaigns", body)
+    return (f"✅ Campanha criada em PAUSED (id {res.get('id','?')}). "
+            f"Próximo: criar conjunto (ad set) + anúncio e usar ads_ativar para veicular.")
+
+
+@mcp.tool()
+def publicar_post_ig(legenda: str = "", image_url: str = "", video_url: str = "") -> str:
+    """Publica um post no Instagram (@vienna.pet). Informe image_url OU video_url — precisa ser URL
+    PÚBLICA do arquivo. Requer POSTS_WRITES_ENABLED=true. Obs: o IG publica na hora (sem agendamento
+    nativo); vídeo/Reels pode levar alguns segundos processando antes de publicar."""
+    _require_write()
+    _posts_assert_writes_enabled()
+    d = _meta_require()
+    ig = d.get("ig_id")
+    if not ig:
+        return "Instagram não vinculado à Página."
+    if not image_url and not video_url:
+        return "Erro: informe image_url ou video_url (URL pública)."
+    container: dict = {"caption": legenda}
+    if video_url:
+        container["media_type"] = "REELS"
+        container["video_url"] = video_url
+    else:
+        container["image_url"] = image_url
+    cont = _meta_post(f"{ig}/media", container)
+    creation_id = cont.get("id")
+    if not creation_id:
+        return f"Erro ao criar container de mídia: {cont}"
+    pub = _meta_post(f"{ig}/media_publish", {"creation_id": creation_id})
+    return f"✅ Post publicado no Instagram (id {pub.get('id','?')})."
+
+
+@mcp.tool()
+def publicar_post_fb(mensagem: str, link: str = "", agendar_em: str = "") -> str:
+    """Publica (ou AGENDA) um post na Página do Facebook. agendar_em opcional no formato
+    'AAAA-MM-DD HH:MM' (10min a 75 dias no futuro) usa o agendamento NATIVO do FB; vazio = publica agora.
+    Requer POSTS_WRITES_ENABLED=true."""
+    _require_write()
+    _posts_assert_writes_enabled()
+    d = _meta_require()
+    page_id = d.get("page_id")
+    if not page_id:
+        return "Página do Facebook não conectada."
+    if not mensagem.strip():
+        return "Erro: informe a mensagem do post."
+    body: dict = {"message": mensagem}
+    if link.strip():
+        body["link"] = link.strip()
+    if agendar_em.strip():
+        import datetime as _dt
+        try:
+            ts = int(_dt.datetime.fromisoformat(agendar_em.strip()).timestamp())
+        except Exception:
+            return "Erro: agendar_em deve ser 'AAAA-MM-DD HH:MM'."
+        body["published"] = "false"
+        body["scheduled_publish_time"] = ts
+    res = _meta_post(f"{page_id}/feed", body)
+    quando = f"agendado para {agendar_em.strip()}" if agendar_em.strip() else "publicado agora"
+    return f"✅ Post {quando} no Facebook (id {res.get('id','?')})."
 
 
 # ── Admin API ─────────────────────────────────────────────────────────────────
