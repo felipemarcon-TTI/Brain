@@ -1,0 +1,21 @@
+# Segredos — NUNCA subir (reforço; cada pasta também tem o seu)
+.env
+*.env
+.env.*
+!.env.example
+.bling/
+.expansaopet-bling/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+
+# IDEs / SO
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
