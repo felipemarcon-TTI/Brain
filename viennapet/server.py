@@ -944,6 +944,7 @@ async def health_sistema(request: Request) -> JSONResponse:
         "status": "ok" if all_ok else "atencao",
         "checks": checks,
         "woocommerce_writes": "habilitada" if WC_WRITES_ENABLED else "DESABILITADA (flag WC_WRITES_ENABLED=false)",
+        "ads_writes": "habilitada" if ADS_WRITES_ENABLED else "DESABILITADA (flag ADS_WRITES_ENABLED=false)",
     })
 
 
@@ -1474,7 +1475,13 @@ META_SCOPES = ",".join([
     "pages_show_list", "pages_read_engagement", "pages_manage_metadata", "pages_messaging",
     "instagram_basic", "instagram_manage_comments", "instagram_manage_messages",
     "business_management",
+    # Ads (Meta Marketing API) — leitura e gestão de campanhas
+    "ads_read", "ads_management",
 ])
+
+# Kill-switch de escrita em Ads (espelha WC_WRITES_ENABLED). Default = desligado para
+# evitar pausar/ativar campanha por engano. Reative com ADS_WRITES_ENABLED=true no Railway.
+ADS_WRITES_ENABLED = os.environ.get("ADS_WRITES_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 _meta_cache: dict | None = None
 META_WEBHOOK_VERIFY_TOKEN = os.environ.get("META_WEBHOOK_VERIFY_TOKEN", "")
@@ -1511,10 +1518,12 @@ def _meta_load() -> dict | None:
     tok = os.environ.get("META_PAGE_TOKEN", "")
     if tok:
         _meta_cache = {
-            "page_token": tok,
-            "page_id":   os.environ.get("META_PAGE_ID", ""),
-            "ig_id":     os.environ.get("META_IG_ID", ""),
-            "page_name": os.environ.get("META_PAGE_NAME", ""),
+            "page_token":    tok,
+            "page_id":       os.environ.get("META_PAGE_ID", ""),
+            "ig_id":         os.environ.get("META_IG_ID", ""),
+            "page_name":     os.environ.get("META_PAGE_NAME", ""),
+            "user_token":    os.environ.get("META_USER_TOKEN", ""),
+            "ad_account_id": os.environ.get("META_AD_ACCOUNT_ID", ""),
         }
         return _meta_cache
     return None
@@ -1524,7 +1533,8 @@ def _meta_save(data: dict) -> None:
     global _meta_cache
     _meta_cache = data
     for key, env in [("page_token", "META_PAGE_TOKEN"), ("page_id", "META_PAGE_ID"),
-                     ("ig_id", "META_IG_ID"), ("page_name", "META_PAGE_NAME")]:
+                     ("ig_id", "META_IG_ID"), ("page_name", "META_PAGE_NAME"),
+                     ("user_token", "META_USER_TOKEN"), ("ad_account_id", "META_AD_ACCOUNT_ID")]:
         _railway_upsert_var(env, data.get(key, "") or "")
 
 
@@ -1551,6 +1561,49 @@ def _meta_post(path: str, data: dict) -> dict:
     if not r.ok:
         raise RuntimeError(f"Meta API {r.status_code}: {r.text[:300]}")
     return r.json()
+
+
+# ── Meta Ads (Marketing API) ──────────────────────────────────────────────────
+# A Marketing API usa o USER long-lived token (não o page token) e uma conta de
+# anúncios (act_...). Ambos são capturados no /meta/callback e persistidos no Railway.
+
+def _meta_ads_require() -> dict:
+    d = _meta_require()
+    if not d.get("user_token"):
+        raise RuntimeError(
+            "Ads não conectado. Reautorize a Meta em /meta/auth?token=SEU_MCP_AUTH_TOKEN "
+            "concedendo as permissões de anúncios (ads_read, ads_management).")
+    if not d.get("ad_account_id"):
+        raise RuntimeError(
+            "Nenhuma conta de anúncios encontrada para este usuário. Verifique se a conta "
+            "tem acesso à conta de anúncios da ViennaPet e reautorize em /meta/auth.")
+    return d
+
+
+def _meta_ads_get(path: str, params: dict | None = None) -> dict:
+    d = _meta_ads_require()
+    p = dict(params or {}); p["access_token"] = d["user_token"]
+    r = requests.get(f"{META_GRAPH}/{path}", params=p, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Meta Ads API {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def _meta_ads_post(path: str, data: dict) -> dict:
+    d = _meta_ads_require()
+    payload = dict(data); payload["access_token"] = d["user_token"]
+    r = requests.post(f"{META_GRAPH}/{path}", data=payload, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Meta Ads API {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def _ads_assert_writes_enabled():
+    """Kill-switch: bloqueia escrita em Ads quando ADS_WRITES_ENABLED=false."""
+    if not ADS_WRITES_ENABLED:
+        raise RuntimeError(
+            "escrita em Ads DESABILITADA (flag ADS_WRITES_ENABLED=false). "
+            "Nenhuma campanha foi alterada. Para reativar, defina ADS_WRITES_ENABLED=true no Railway.")
 
 
 @mcp.custom_route("/meta/auth", methods=["GET"])
@@ -1593,8 +1646,21 @@ async def meta_callback(request: Request) -> HTMLResponse:
             raise RuntimeError("Nenhuma Página encontrada para este usuário.")
         page = next((p for p in pages if p.get("instagram_business_account")), pages[0])
         ig = (page.get("instagram_business_account") or {}).get("id", "")
+        # Marketing API usa o user long-lived token + uma conta de anúncios (act_...)
+        ad_account_id = ""
+        try:
+            r4 = requests.get(f"{META_GRAPH}/me/adaccounts", params={
+                "fields": "id,name,account_status", "access_token": longtok, "limit": 50}, timeout=30)
+            r4.raise_for_status()
+            accounts = r4.json().get("data", [])
+            # Prioriza conta ativa (account_status == 1); senão pega a primeira
+            active = next((a for a in accounts if a.get("account_status") == 1), None)
+            ad_account_id = (active or (accounts[0] if accounts else {})).get("id", "")
+        except Exception:
+            pass
         return {"page_token": page["access_token"], "page_id": page["id"],
-                "ig_id": ig, "page_name": page.get("name", "")}
+                "ig_id": ig, "page_name": page.get("name", ""),
+                "user_token": longtok, "ad_account_id": ad_account_id}
 
     try:
         data = await anyio.to_thread.run_sync(_exchange)
@@ -1604,11 +1670,14 @@ async def meta_callback(request: Request) -> HTMLResponse:
     _meta_save(data)
     ig_msg = (f"Instagram conectado: {data['ig_id']}" if data["ig_id"]
               else "⚠️ Página sem Instagram Business vinculado — conecte a @vienna.pet à Página e refaça.")
+    ads_msg = (f"Conta de anúncios: {data['ad_account_id']}" if data.get("ad_account_id")
+               else "⚠️ Nenhuma conta de anúncios encontrada — confira o acesso a Ads e refaça.")
     return HTMLResponse(
         "<body style='font-family:sans-serif;max-width:600px;margin:40px auto'>"
         "<h2 style='color:green'>Meta conectado com sucesso!</h2>"
         f"<p>Página: <b>{data['page_name']}</b> (id {data['page_id']})</p>"
-        f"<p>{ig_msg}</p><p>Pode fechar esta aba.</p></body>")
+        f"<p>{ig_msg}</p>"
+        f"<p>{ads_msg}</p><p>Pode fechar esta aba.</p></body>")
 
 
 @mcp.custom_route("/meta/teste", methods=["GET"])
@@ -2017,6 +2086,129 @@ def meta_assinar_webhooks() -> str:
     res = _meta_post(f"{d['page_id']}/subscribed_apps",
                      {"subscribed_fields": "feed,messages,message_reactions,messaging_postbacks"})
     return f"✅ Página inscrita nos webhooks: {res}"
+
+
+# ── Tools: Meta Ads (campanhas, insights) ─────────────────────────────────────
+
+@mcp.tool()
+def ads_conexao_status() -> str:
+    """Mostra se a conta de anúncios (Meta Ads) está conectada e qual conta está em uso."""
+    d = _meta_load()
+    if not d or not d.get("user_token"):
+        return ("❌ Ads NÃO conectado. Reautorize a Meta no navegador:\n"
+                f"{_BASE_URL}/meta/auth?token=SEU_MCP_AUTH_TOKEN\n"
+                "concedendo as permissões de anúncios (ads_read, ads_management).")
+    conta = d.get("ad_account_id") or "NÃO encontrada"
+    escrita = "habilitada" if ADS_WRITES_ENABLED else "DESABILITADA (ADS_WRITES_ENABLED=false)"
+    return f"✅ Ads conectado | Conta: {conta} | Escrita: {escrita}"
+
+
+@mcp.tool()
+def ads_listar_campanhas(status: str = "", limite: int = 25) -> str:
+    """Lista campanhas da conta de anúncios. status opcional: ACTIVE, PAUSED, ARCHIVED."""
+    d = _meta_ads_require()
+    params = {"fields": "id,name,status,objective,daily_budget,lifetime_budget",
+              "limit": min(limite, 100)}
+    if status.strip():
+        params["effective_status"] = json.dumps([status.strip().upper()])
+    data = _meta_ads_get(f"{d['ad_account_id']}/campaigns", params)
+    camps = data.get("data", [])
+    if not camps:
+        return "Nenhuma campanha encontrada."
+    linhas = []
+    for c in camps:
+        orc = c.get("daily_budget") or c.get("lifetime_budget")
+        orc_txt = f"R$ {int(orc)/100:.2f}" if orc else "—"
+        linhas.append(f"- [{c['id']}] {c.get('name','?')} | {c.get('status','?')} | "
+                      f"{c.get('objective','?')} | orçamento {orc_txt}")
+    return f"**{len(camps)} campanha(s):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def ads_listar_adsets(campaign_id: str = "", limite: int = 25) -> str:
+    """Lista os conjuntos de anúncios (ad sets). Sem campaign_id: todos da conta."""
+    d = _meta_ads_require()
+    base = campaign_id.strip() or d["ad_account_id"]
+    data = _meta_ads_get(f"{base}/adsets", {
+        "fields": "id,name,status,daily_budget,optimization_goal,campaign_id",
+        "limit": min(limite, 100)})
+    sets = data.get("data", [])
+    if not sets:
+        return "Nenhum conjunto de anúncios encontrado."
+    linhas = [f"- [{s['id']}] {s.get('name','?')} | {s.get('status','?')} | "
+              f"meta {s.get('optimization_goal','?')}" for s in sets]
+    return f"**{len(sets)} conjunto(s):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def ads_listar_anuncios(adset_id: str = "", limite: int = 25) -> str:
+    """Lista anúncios individuais. Sem adset_id: todos da conta."""
+    d = _meta_ads_require()
+    base = adset_id.strip() or d["ad_account_id"]
+    data = _meta_ads_get(f"{base}/ads", {
+        "fields": "id,name,status,adset_id,creative", "limit": min(limite, 100)})
+    ads = data.get("data", [])
+    if not ads:
+        return "Nenhum anúncio encontrado."
+    linhas = [f"- [{a['id']}] {a.get('name','?')} | {a.get('status','?')}" for a in ads]
+    return f"**{len(ads)} anúncio(s):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def ads_insights(nivel: str = "campaign", periodo_dias: int = 7) -> str:
+    """Métricas de desempenho dos anúncios (gasto, impressões, cliques, CTR, CPC, compras/ROAS).
+    nivel: account, campaign, adset ou ad. periodo_dias: janela em dias (default 7)."""
+    d = _meta_ads_require()
+    nivel = nivel.strip().lower()
+    if nivel not in ("account", "campaign", "adset", "ad"):
+        nivel = "campaign"
+    import time as _t
+    until = int(_t.time()); since = until - max(periodo_dias, 1) * 86400
+    import datetime as _dt
+    rng = json.dumps({"since": _dt.date.fromtimestamp(since).isoformat(),
+                      "until": _dt.date.fromtimestamp(until).isoformat()})
+    data = _meta_ads_get(f"{d['ad_account_id']}/insights", {
+        "level": nivel,
+        "fields": "campaign_name,adset_name,ad_name,spend,impressions,clicks,ctr,cpc,actions,action_values",
+        "time_range": rng, "limit": 100})
+    rows = data.get("data", [])
+    if not rows:
+        return f"Sem dados de insights para os últimos {periodo_dias} dias."
+    linhas = []
+    for r in rows:
+        nome = r.get("campaign_name") or r.get("adset_name") or r.get("ad_name") or "conta"
+        compras = next((a.get("value") for a in r.get("actions", [])
+                        if a.get("action_type") in ("purchase", "omni_purchase")), "0")
+        receita = next((a.get("value") for a in r.get("action_values", [])
+                        if a.get("action_type") in ("purchase", "omni_purchase")), "0")
+        spend = float(r.get("spend", 0) or 0)
+        roas = (float(receita) / spend) if spend else 0
+        linhas.append(f"- {nome}: gasto R$ {spend:.2f} | {r.get('impressions','0')} impr | "
+                      f"{r.get('clicks','0')} cliques | CTR {r.get('ctr','0')}% | CPC R$ {r.get('cpc','0')} | "
+                      f"{compras} compras | ROAS {roas:.2f}")
+    return f"**Insights ({nivel}, {periodo_dias}d):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def ads_pausar(entity_id: str) -> str:
+    """Pausa uma campanha, conjunto ou anúncio (status=PAUSED). Requer ADS_WRITES_ENABLED=true."""
+    _require_write()
+    _ads_assert_writes_enabled()
+    if not entity_id.strip():
+        return "Erro: informe o id da campanha/conjunto/anúncio."
+    _meta_ads_post(entity_id.strip(), {"status": "PAUSED"})
+    return f"✅ {entity_id} pausado (status=PAUSED)."
+
+
+@mcp.tool()
+def ads_ativar(entity_id: str) -> str:
+    """Ativa uma campanha, conjunto ou anúncio (status=ACTIVE). Requer ADS_WRITES_ENABLED=true."""
+    _require_write()
+    _ads_assert_writes_enabled()
+    if not entity_id.strip():
+        return "Erro: informe o id da campanha/conjunto/anúncio."
+    _meta_ads_post(entity_id.strip(), {"status": "ACTIVE"})
+    return f"✅ {entity_id} ativado (status=ACTIVE)."
 
 
 # ── Admin API ─────────────────────────────────────────────────────────────────
