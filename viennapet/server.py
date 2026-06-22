@@ -843,6 +843,37 @@ def listar_paginas_wp() -> str:
 
 
 @mcp.tool()
+def criar_pagina_wp(titulo: str, conteudo_html: str, status: str = "publish", slug: str = "") -> str:
+    """Cria uma página no WordPress. conteudo_html aceita HTML. status: publish ou draft. slug opcional."""
+    _require_write()
+    if not titulo.strip() or not conteudo_html.strip():
+        return "Erro: informe título e conteúdo."
+    body: dict = {"title": titulo.strip(), "content": conteudo_html, "status": (status.strip() or "publish")}
+    if slug.strip():
+        body["slug"] = slug.strip()
+    p = _wp_post("wp/v2/pages", body)
+    titulo_final = (p.get("title", {}) or {}).get("rendered", titulo)
+    return f"✓ Página criada [#{p.get('id','?')}] {titulo_final} | {p.get('status','?')} | {p.get('link','')}"
+
+
+@mcp.tool()
+def atualizar_pagina_wp(page_id: int, titulo: str = "", conteudo_html: str = "", status: str = "") -> str:
+    """Atualiza uma página do WordPress (título/conteúdo/status). Deixe em branco o que não quer mudar."""
+    _require_write()
+    body: dict = {}
+    if titulo.strip():
+        body["title"] = titulo.strip()
+    if conteudo_html.strip():
+        body["content"] = conteudo_html
+    if status.strip():
+        body["status"] = status.strip()
+    if not body:
+        return "Nenhum campo informado para atualizar."
+    p = _wp_post(f"wp/v2/pages/{page_id}", body)
+    return f"✓ Página #{p.get('id','?')} atualizada | {p.get('status','?')} | {p.get('link','')}"
+
+
+@mcp.tool()
 def listar_plugins_wp() -> str:
     """Lista todos os plugins instalados no WordPress e seus status."""
     plugins = _wp_get("wp/v2/plugins", {"per_page": 100})
