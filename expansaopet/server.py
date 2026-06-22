@@ -201,34 +201,62 @@ def _bling_get_token() -> str:
         raise RuntimeError("Nao autenticado. Use a ferramenta `autenticar_bling` primeiro.")
     return tokens["access_token"]
 
+# ── Rate limiting global (Bling v3 ~3 req/s) ──────────────────────────────────
+# Throttle thread-safe (vale para threads dos relatórios) + retry automático em 429.
+# Centraliza o que antes estava espalhado em time.sleep(0.35) manuais.
+_BLING_MIN_INTERVAL = float(os.environ.get("BLING_MIN_INTERVAL", "0.34"))  # ~3 req/s
+_BLING_MAX_RETRIES  = int(os.environ.get("BLING_MAX_RETRIES", "4"))
+_bling_rate_lock    = threading.Lock()
+_bling_last_call    = 0.0
+
+
+def _bling_throttle() -> None:
+    global _bling_last_call
+    with _bling_rate_lock:
+        wait = _BLING_MIN_INTERVAL - (time.monotonic() - _bling_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _bling_last_call = time.monotonic()
+
+
+def _bling_request(method: str, url: str, *, params: dict | None = None, json_body: dict | None = None) -> dict:
+    """Chamada única ao Bling com throttle, refresh de token (401) e retry em 429."""
+    token     = _bling_get_token()
+    refreshed = False
+    for attempt in range(_BLING_MAX_RETRIES):
+        _bling_throttle()
+        headers = {"Authorization": f"Bearer {token}"}
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+        resp = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=30)
+        if resp.status_code == 401 and not refreshed:
+            token = _bling_refresh_token(old_access_token=token)
+            refreshed = True
+            continue
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else (1.0 + attempt)
+            time.sleep(min(wait, 5.0))
+            continue
+        if not resp.ok:
+            raise RuntimeError(f"Bling API {resp.status_code}: {resp.text[:300]}")
+        return resp.json() if resp.content else {}
+    raise RuntimeError(f"Bling API: limite de requisições (429) excedido após {_BLING_MAX_RETRIES} tentativas.")
+
+
 def _bling_get(path: str, params: dict | None = None) -> dict:
-    token = _bling_get_token()
-    resp = requests.get(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}"}, params=params or {})
-    if resp.status_code == 401:
-        token = _bling_refresh_token(old_access_token=token)
-        resp = requests.get(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}"}, params=params or {})
-    resp.raise_for_status()
-    return resp.json()
+    return _bling_request("GET", f"{BLING_BASE_URL}{path}", params=params or {})
 
 def _bling_put(path: str, body: dict) -> dict:
-    token = _bling_get_token()
-    resp = requests.put(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
-    if resp.status_code == 401:
-        token = _bling_refresh_token()
-        resp = requests.put(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
-    if not resp.ok:
-        raise RuntimeError(f"Bling API {resp.status_code}: {resp.text}")
-    return resp.json() if resp.content else {}
+    return _bling_request("PUT", f"{BLING_BASE_URL}{path}", json_body=body)
 
 def _bling_post(path: str, body: dict) -> dict:
-    token = _bling_get_token()
-    resp = requests.post(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
-    if resp.status_code == 401:
-        token = _bling_refresh_token()
-        resp = requests.post(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
-    if not resp.ok:
-        raise RuntimeError(f"Bling API {resp.status_code}: {resp.text}")
-    return resp.json() if resp.content else {}
+    return _bling_request("POST", f"{BLING_BASE_URL}{path}", json_body=body)
+
+def _bling_estoque_saldos(id_produto: int) -> list:
+    """Saldo de estoque de um produto. Endpoint exige colchetes literais na query — não usar params={}."""
+    url = f"{BLING_BASE_URL}/estoques/saldos?idsProdutos[]={id_produto}"
+    return _bling_request("GET", url).get("data", [])
 
 
 # ── Health check ─────────────────────────────────────────────────────────────
@@ -240,7 +268,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v4 - 23 tools (+ relatorio_diario; fix fluxo_de_caixa, rate limit)", status_code=200)
+    return HTMLResponse("v5 - 23 tools (rate limiter global Bling + retry 429; estoque helper DRY)", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -507,7 +535,6 @@ def buscar_pedido_bling(id_pedido: int) -> str:
 @mcp.tool()
 def relatorio_mais_vendidos_bling(data_inicio: str = "2026-01-01", data_fim: str = "", top_n: int = 20, situacao: int = 9) -> str:
     """(ExpansaoPet) Produtos mais vendidos no periodo. data_inicio/data_fim: YYYY-MM-DD. top_n: quantidade (pad 20). situacao: 0=todos,6=aberto,9=atendido(pad),12=cancelado."""
-    from collections import defaultdict
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import date as _date
 
@@ -577,17 +604,7 @@ def relatorio_mais_vendidos_bling(data_inicio: str = "2026-01-01", data_fim: str
 @mcp.tool()
 def consultar_estoque_bling(id_produto: int) -> str:
     """(ExpansaoPet) Consulta o saldo de estoque de um produto pelo seu ID."""
-    token = _bling_get_token()
-    # Endpoint requer colchetes literais na query string — não usar params={}
-    url = f"{BLING_BASE_URL}/estoques/saldos?idsProdutos[]={id_produto}"
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(url, headers=headers)
-    if resp.status_code == 401:
-        token = _bling_refresh_token()
-        headers = {"Authorization": f"Bearer {token}"}
-        resp = requests.get(url, headers=headers)
-    resp.raise_for_status()
-    items = resp.json().get("data", [])
+    items = _bling_estoque_saldos(id_produto)
     if not items:
         return f"Produto {id_produto} não encontrado no estoque."
     saldo_fisico  = sum(i.get("saldoFisicoTotal",  i.get("saldoFisico",  0)) for i in items)
@@ -831,13 +848,7 @@ def alertas_estoque_baixo(limite: int = 100) -> str:
         return "Nenhum produto encontrado."
     def _saldo(prod: dict) -> dict:
         try:
-            url = f"{BLING_BASE_URL}/estoques/saldos?idsProdutos[]={prod['id']}"
-            token = _bling_get_token()
-            resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
-            if resp.status_code == 401:
-                token = _bling_refresh_token()
-                resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
-            saldo = sum(i.get("saldoFisicoTotal", i.get("saldoFisico", 0)) for i in resp.json().get("data", []))
+            saldo = sum(i.get("saldoFisicoTotal", i.get("saldoFisico", 0)) for i in _bling_estoque_saldos(prod["id"]))
         except Exception:
             saldo = None
         return {"prod": prod, "saldo": saldo}
@@ -926,10 +937,7 @@ def sugestao_reposicao(dias_analise: int = 30, dias_cobertura: int = 30, limite:
         return "Nenhuma venda encontrada no periodo para calcular reposicao."
     def _saldo(id_prod: int) -> tuple:
         try:
-            url = f"{BLING_BASE_URL}/estoques/saldos?idsProdutos[]={id_prod}"
-            resp = requests.get(url, headers={"Authorization": f"Bearer {_bling_get_token()}"})
-            time.sleep(0.35)
-            return id_prod, float(sum(i.get("saldoFisicoTotal", i.get("saldoFisico", 0)) for i in resp.json().get("data", [])))
+            return id_prod, float(sum(i.get("saldoFisicoTotal", i.get("saldoFisico", 0)) for i in _bling_estoque_saldos(id_prod)))
         except Exception:
             return id_prod, 0.0
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -976,7 +984,6 @@ def clientes_inativos(dias: int = 60) -> str:
         if len(pedidos) < 100:
             break
         pagina += 1
-        time.sleep(0.35)
     params2 = {"dataInicial": str(hoje - timedelta(days=365)), "dataFinal": data_corte, "pagina": 1, "limite": 100}
     ultimo_pedido: dict = {}
     pagina = 1
@@ -996,7 +1003,6 @@ def clientes_inativos(dias: int = 60) -> str:
         if len(pedidos) < 100:
             break
         pagina += 1
-        time.sleep(0.35)
     if not ultimo_pedido:
         return f"Todos os clientes compraram nos ultimos {dias} dias."
     inativos = sorted(ultimo_pedido.values(), key=lambda x: x["data"])
@@ -1144,9 +1150,7 @@ def resumo_do_dia() -> str:
             if minimo <= 0:
                 continue
             try:
-                url = f"{BLING_BASE_URL}/estoques/saldos?idsProdutos[]={p['id']}"
-                resp = requests.get(url, headers={"Authorization": f"Bearer {_bling_get_token()}"})
-                if sum(i.get("saldoFisicoTotal", i.get("saldoFisico", 0)) for i in resp.json().get("data", [])) <= minimo:
+                if sum(i.get("saldoFisicoTotal", i.get("saldoFisico", 0)) for i in _bling_estoque_saldos(p["id"])) <= minimo:
                     criticos += 1
             except Exception:
                 pass
@@ -1235,7 +1239,6 @@ def relatorio_diario(data: str = "") -> str:
         p = dict(params_base)
         while True:
             p["pagina"] = pag
-            time.sleep(0.35)
             itens = _bling_get("/pedidos/vendas", p).get("data", [])
             if not itens:
                 break
@@ -1258,7 +1261,6 @@ def relatorio_diario(data: str = "") -> str:
     if 0 < n_pedidos <= 30:
         for p in atendidos:
             try:
-                time.sleep(0.35)
                 pedido = _bling_get(f"/pedidos/vendas/{p['id']}").get("data", {})
             except Exception:
                 continue
