@@ -284,7 +284,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v6 - 29 tools (observe-only: Bling writes atrás de kill-switch + Meta Ads leitura/ROAS)", status_code=200)
+    return HTMLResponse("v6 - 30 tools (observe-only: Bling writes atrás de kill-switch + Meta Ads leitura/ROAS + listar contas)", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -1596,6 +1596,33 @@ def ads_conexao_status() -> str:
     conta = d.get("ad_account_id") or "NÃO encontrada"
     nome  = d.get("account_name") or "?"
     return f"✅ Meta Ads conectado (somente leitura) | Conta: {nome} ({conta})"
+
+
+@mcp.tool()
+def ads_listar_contas() -> str:
+    """(ExpansaoPet) Lista TODAS as contas de anúncios que o login conectado pode acessar
+    (id, nome, status), marcando a que está em uso. Útil para descobrir/conferir qual
+    `act_...` colocar em META_AD_ACCOUNT_ID quando o ROAS vier zerado por conta errada."""
+    d = _meta_load()
+    if not d or not d.get("user_token"):
+        return ("❌ Meta não conectado. Autorize primeiro em "
+                f"{_BASE_URL}/meta/auth?token=SEU_MCP_AUTH_TOKEN")
+    r = requests.get(f"{META_GRAPH}/me/adaccounts", params={
+        "fields": "id,name,account_status", "access_token": d["user_token"], "limit": 100}, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Meta Ads API {r.status_code}: {r.text[:300]}")
+    contas = r.json().get("data", [])
+    if not contas:
+        return "Nenhuma conta de anúncios acessível por este login."
+    atual = d.get("ad_account_id", "")
+    linhas = []
+    for c in contas:
+        marca = "  ← EM USO" if c.get("id") == atual else ""
+        st = "ativa" if c.get("account_status") == 1 else f"status {c.get('account_status')}"
+        linhas.append(f"- {c.get('name','?')} | `{c.get('id')}` | {st}{marca}")
+    return (f"**{len(contas)} conta(s) de anúncios acessíveis:**\n" + "\n".join(linhas) +
+            "\n\n_Para trocar a conta em uso: defina `META_AD_ACCOUNT_ID` no Railway com o id desejado "
+            "(ex.: `act_123...`) e salve — o serviço reinicia e passa a usar a nova conta._")
 
 
 @mcp.tool()
