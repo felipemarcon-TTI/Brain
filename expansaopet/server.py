@@ -63,7 +63,7 @@ _users_by_token, _users_by_id = _load_users()
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
 _OPEN_PATHS = frozenset({
-    "/", "/version", "/bling/callback",
+    "/", "/version", "/bling/callback", "/meta/callback",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -80,7 +80,7 @@ class _AuthMiddleware:
                 auth = headers.get(b"authorization", b"").decode("latin-1")
                 bearer = auth[7:] if auth.startswith("Bearer ") else ""
 
-                if not bearer and path == "/bling/auth":
+                if not bearer and path in ("/bling/auth", "/meta/auth"):
                     qs = scope.get("query_string", b"").decode()
                     bearer = dict(_urlparse.parse_qsl(qs)).get("token", "")
 
