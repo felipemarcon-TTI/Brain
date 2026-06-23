@@ -34,15 +34,20 @@ catálogo do que cada serviço usa.
 ### Google Sheets (cupons/afiliados)
 - `SHEETS_WEBHOOK_URL`, `SHEETS_SECRET`
 
-## ExpansaoPet (`expansaopet/`) — isolado, Bling-only
+## ExpansaoPet (`expansaopet/`) — Bling + Meta Ads (somente leitura)
 
 - `MCP_AUTH_TOKEN`, `MCP_USERS`
 - `BLING_CLIENT_ID`, `BLING_CLIENT_SECRET`, `BLING_REDIRECT_URI`, `BLING_TOKEN_FILE`
+- `BLING_WRITES_ENABLED` (default `false` — observe-only; ligue só com confirmação expressa)
+- `META_APP_ID`, `META_APP_SECRET` (app próprio da ExpansaoPet; conecte via `/meta/auth`)
+- `META_USER_TOKEN`, `META_AD_ACCOUNT_ID`, `META_AD_ACCOUNT_NAME` (preenchidos no `/meta/callback`)
 - `RAILWAY_API_TOKEN`, `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID`, `RAILWAY_SERVICE_ID`
 - `RAILWAY_PUBLIC_DOMAIN`, `PORT`
 
-> ExpansaoPet **não tem** nenhuma var de WooCommerce/WordPress/Meta — e não deve ter.
-> Mantém o isolamento total em relação ao ViennaPet.
+> ExpansaoPet é **observe-only**: lê vendas/financeiro (Bling) e eficácia de Ads/ROAS (Meta,
+> scope `ads_read` apenas — sem gestão de campanhas). Escrita no Bling fica atrás do
+> kill-switch `BLING_WRITES_ENABLED`. App e conta de Ads são **próprios** da ExpansaoPet,
+> separados do ViennaPet.
 
 ## Novas vars a configurar para os Ads (ViennaPet)
 

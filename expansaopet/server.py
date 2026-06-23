@@ -114,6 +114,22 @@ def _require_write() -> None:
         raise PermissionError(f"Usuário '{uid}' tem acesso somente leitura.")
 
 
+# Kill-switch de escrita no Bling. A ExpansaoPet é observe-only por padrão: as tools
+# que alteram o Bling (atualizar produto / criar pedido) ficam BLOQUEADAS até você dar
+# a confirmação expressa definindo BLING_WRITES_ENABLED=true no Railway (espelha o
+# padrão WC_WRITES_ENABLED da ViennaPet).
+BLING_WRITES_ENABLED = os.environ.get("BLING_WRITES_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _bling_assert_writes_enabled() -> None:
+    """Kill-switch: bloqueia qualquer escrita no Bling quando BLING_WRITES_ENABLED=false."""
+    if not BLING_WRITES_ENABLED:
+        raise RuntimeError(
+            "escrita no Bling DESABILITADA (flag BLING_WRITES_ENABLED=false). "
+            "A ExpansaoPet só observa/analisa. Nenhuma alteração foi feita. "
+            "Para liberar (confirmação expressa), defina BLING_WRITES_ENABLED=true no Railway.")
+
+
 # ── Bling helpers ─────────────────────────────────────────────────────────────
 
 def _bling_credentials_header() -> str:
@@ -268,7 +284,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v5 - 23 tools (rate limiter global Bling + retry 429; estoque helper DRY)", status_code=200)
+    return HTMLResponse("v6 - 29 tools (observe-only: Bling writes atrás de kill-switch + Meta Ads leitura/ROAS)", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -624,8 +640,10 @@ def consultar_estoque_bling(id_produto: int) -> str:
 
 @mcp.tool()
 def atualizar_produto_bling(id_produto: int, preco: float = 0.0, nome: str = "", codigo: str = "") -> str:
-    """(ExpansaoPet) Atualiza preço, nome e/ou código de um produto no Bling! pelo seu ID."""
+    """(ExpansaoPet) Atualiza preço, nome e/ou código de um produto no Bling! pelo seu ID.
+    Escrita: requer BLING_WRITES_ENABLED=true (observe-only por padrão)."""
     _require_write()
+    _bling_assert_writes_enabled()
     if not preco and not nome and not codigo:
         return "Nenhum campo informado para atualizar."
     produto = _bling_get(f"/produtos/{id_produto}").get("data", {})
@@ -657,8 +675,10 @@ def atualizar_produto_bling(id_produto: int, preco: float = 0.0, nome: str = "",
 
 @mcp.tool()
 def criar_pedido_venda_bling(id_contato: int, itens: list[dict], numero_pedido_externo: str = "", observacoes: str = "") -> str:
-    """(ExpansaoPet) Cria pedido de venda no Bling. itens: lista de dicts {id_produto_bling, descricao, quantidade, valor}."""
+    """(ExpansaoPet) Cria pedido de venda no Bling. itens: lista de dicts {id_produto_bling, descricao, quantidade, valor}.
+    Escrita: requer BLING_WRITES_ENABLED=true (observe-only por padrão)."""
     _require_write()
+    _bling_assert_writes_enabled()
     bling_itens = []
     for item in itens:
         i: dict = {
@@ -1389,6 +1409,307 @@ async def admin_export(request: Request) -> JSONResponse:
     ]
     return JSONResponse(users)
 
+
+# ── Meta Ads (Marketing API) — eficácia de anúncios e ROAS ────────────────────
+# ExpansaoPet é focado em Bling (vendas/financeiro). Aqui adicionamos LEITURA de
+# Ads do Meta (gasto, cliques, compras) + cálculo de ROAS. Usamos o USER long-lived
+# token (não page token) e uma conta de anúncios (act_...), capturados no
+# /meta/callback e persistidos nas env vars do Railway (sobrevive a restart, como o
+# Bling). Espelha a implementação já validada na ViennaPet, sem as tools sociais.
+
+META_APP_ID       = os.environ.get("META_APP_ID", "")
+META_APP_SECRET   = os.environ.get("META_APP_SECRET", "")
+META_REDIRECT_URI = os.environ.get("META_REDIRECT_URI", f"{_BASE_URL}/meta/callback")
+META_GRAPH        = "https://graph.facebook.com/v21.0"
+# Marketing API: SOMENTE LEITURA. A ExpansaoPet apenas observa/analisa Ads — nunca
+# altera campanhas. Por isso pedimos só ads_read (e business_management p/ enxergar a
+# conta), sem ads_management. Não há tools de escrita aqui (sem pausar/ativar/criar).
+META_SCOPES = ",".join(["ads_read", "business_management"])
+
+_meta_cache: dict | None = None
+
+
+def _railway_upsert_var(name: str, value: str) -> bool:
+    """Grava uma env var no próprio serviço Railway (genérico). Usado p/ persistir
+    os tokens Meta entre restarts (disco efêmero). Reutiliza as mesmas RAILWAY_* do Bling."""
+    api_token      = os.environ.get("RAILWAY_API_TOKEN", "")
+    project_id     = os.environ.get("RAILWAY_PROJECT_ID", "")
+    environment_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+    service_id     = os.environ.get("RAILWAY_SERVICE_ID", "")
+    if not all([api_token, project_id, environment_id, service_id]) or value is None:
+        return False
+    query = "mutation variableUpsert($input: VariableUpsertInput!) { variableUpsert(input: $input) }"
+    variables = {"input": {"projectId": project_id, "environmentId": environment_id,
+                           "serviceId": service_id, "name": name, "value": value}}
+    try:
+        resp = requests.post("https://backboard.railway.app/graphql/v2",
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+            json={"query": query, "variables": variables}, timeout=10)
+        resp.raise_for_status()
+        return not resp.json().get("errors")
+    except Exception as e:
+        print(f"[railway] upsert {name} erro: {e}")
+        return False
+
+
+def _meta_load() -> dict | None:
+    global _meta_cache
+    if _meta_cache:
+        return _meta_cache
+    tok = os.environ.get("META_USER_TOKEN", "")
+    if tok:
+        _meta_cache = {
+            "user_token":    tok,
+            "ad_account_id": os.environ.get("META_AD_ACCOUNT_ID", ""),
+            "account_name":  os.environ.get("META_AD_ACCOUNT_NAME", ""),
+        }
+        return _meta_cache
+    return None
+
+
+def _meta_save(data: dict) -> None:
+    global _meta_cache
+    _meta_cache = data
+    for key, env in [("user_token", "META_USER_TOKEN"),
+                     ("ad_account_id", "META_AD_ACCOUNT_ID"),
+                     ("account_name", "META_AD_ACCOUNT_NAME")]:
+        _railway_upsert_var(env, data.get(key, "") or "")
+
+
+def _meta_ads_require() -> dict:
+    d = _meta_load()
+    if not d or not d.get("user_token"):
+        raise RuntimeError(
+            "Meta Ads não conectado. Abra /meta/auth?token=SEU_MCP_AUTH_TOKEN no navegador "
+            "e autorize (permissão ads_read — somente leitura).")
+    if not d.get("ad_account_id"):
+        raise RuntimeError(
+            "Nenhuma conta de anúncios encontrada para este usuário. Confirme o acesso à "
+            "conta de Ads da ExpansaoPet e reautorize em /meta/auth.")
+    return d
+
+
+def _meta_ads_get(path: str, params: dict | None = None) -> dict:
+    d = _meta_ads_require()
+    p = dict(params or {}); p["access_token"] = d["user_token"]
+    r = requests.get(f"{META_GRAPH}/{path}", params=p, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Meta Ads API {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def _meta_spend_no_periodo(d1, d2) -> float:
+    """Gasto total (R$) da conta de anúncios no intervalo [d1, d2] (datas inclusivas)."""
+    rng = json.dumps({"since": str(d1), "until": str(d2)})
+    data = _meta_ads_get(f"{_meta_ads_require()['ad_account_id']}/insights", {
+        "level": "account", "fields": "spend", "time_range": rng})
+    rows = data.get("data", [])
+    return float(rows[0].get("spend", 0) or 0) if rows else 0.0
+
+
+def _bling_faturamento_periodo(d1, d2) -> tuple[float, int]:
+    """Faturamento real (R$) e nº de pedidos atendidos (idSituacao=9) no Bling no intervalo."""
+    params = {"dataInicial": str(d1), "dataFinal": str(d2), "idSituacao": 9, "pagina": 1, "limite": 100}
+    total, count, pag = 0.0, 0, 1
+    while True:
+        params["pagina"] = pag
+        pedidos = _bling_get("/pedidos/vendas", params).get("data", [])
+        if not pedidos:
+            break
+        for p in pedidos:
+            total += float(p.get("totalProdutos", 0) or 0)
+            count += 1
+        if len(pedidos) < 100:
+            break
+        pag += 1
+    return total, count
+
+
+@mcp.custom_route("/meta/auth", methods=["GET"])
+async def meta_auth(request: Request) -> HTMLResponse:
+    if not META_APP_ID or not META_APP_SECRET:
+        return HTMLResponse("Configure META_APP_ID e META_APP_SECRET no Railway antes de autenticar.", status_code=400)
+    state = secrets.token_urlsafe(16)
+    _bling_pending_state[state] = "meta"
+    url = (f"https://www.facebook.com/v21.0/dialog/oauth?client_id={META_APP_ID}"
+           f"&redirect_uri={META_REDIRECT_URI}&response_type=code&state={state}&scope={META_SCOPES}")
+    return RedirectResponse(url)
+
+
+@mcp.custom_route("/meta/callback", methods=["GET"])
+async def meta_callback(request: Request) -> HTMLResponse:
+    code  = request.query_params.get("code")
+    state = request.query_params.get("state", "")
+    err   = request.query_params.get("error_description")
+    if err:
+        return HTMLResponse(f"<h2>Erro Meta:</h2><p>{err}</p>", status_code=400)
+    if not code:
+        return HTMLResponse("<h2>Erro: code não recebido.</h2>", status_code=400)
+    if state and state not in _bling_pending_state:
+        return HTMLResponse("<h2>Erro: estado inválido (possível CSRF).</h2>", status_code=400)
+    _bling_pending_state.pop(state, None)
+
+    def _exchange():
+        r = requests.get(f"{META_GRAPH}/oauth/access_token", params={
+            "client_id": META_APP_ID, "redirect_uri": META_REDIRECT_URI,
+            "client_secret": META_APP_SECRET, "code": code}, timeout=30)
+        r.raise_for_status()
+        short = r.json()["access_token"]
+        r2 = requests.get(f"{META_GRAPH}/oauth/access_token", params={
+            "grant_type": "fb_exchange_token", "client_id": META_APP_ID,
+            "client_secret": META_APP_SECRET, "fb_exchange_token": short}, timeout=30)
+        r2.raise_for_status()
+        longtok = r2.json()["access_token"]
+        r3 = requests.get(f"{META_GRAPH}/me/adaccounts", params={
+            "fields": "id,name,account_status", "access_token": longtok, "limit": 50}, timeout=30)
+        r3.raise_for_status()
+        accounts = r3.json().get("data", [])
+        # Prioriza conta ativa (account_status == 1); senão pega a primeira
+        active = next((a for a in accounts if a.get("account_status") == 1), None)
+        chosen = active or (accounts[0] if accounts else {})
+        return {"user_token": longtok, "ad_account_id": chosen.get("id", ""),
+                "account_name": chosen.get("name", "")}
+
+    try:
+        data = await anyio.to_thread.run_sync(_exchange)
+    except Exception as e:
+        return HTMLResponse(f"<h2>Erro ao conectar Meta:</h2><pre>{str(e)[:500]}</pre>", status_code=500)
+
+    _meta_save(data)
+    ads_msg = (f"Conta de anúncios: <b>{data['account_name'] or '?'}</b> ({data['ad_account_id']})"
+               if data.get("ad_account_id")
+               else "⚠️ Nenhuma conta de anúncios encontrada — confira o acesso a Ads e refaça.")
+    return HTMLResponse(
+        "<body style='font-family:sans-serif;max-width:600px;margin:40px auto'>"
+        "<h2 style='color:green'>Meta Ads conectado com sucesso!</h2>"
+        f"<p>{ads_msg}</p><p>Pode fechar esta aba.</p></body>")
+
+
+@mcp.tool()
+def ads_conexao_status() -> str:
+    """(ExpansaoPet) Mostra se a conta de anúncios (Meta Ads) está conectada e qual está em uso."""
+    d = _meta_load()
+    if not d or not d.get("user_token"):
+        return ("❌ Meta Ads NÃO conectado. Autorize no navegador:\n"
+                f"{_BASE_URL}/meta/auth?token=SEU_MCP_AUTH_TOKEN\n"
+                "concedendo a permissão de leitura de anúncios (ads_read).")
+    conta = d.get("ad_account_id") or "NÃO encontrada"
+    nome  = d.get("account_name") or "?"
+    return f"✅ Meta Ads conectado (somente leitura) | Conta: {nome} ({conta})"
+
+
+@mcp.tool()
+def ads_listar_campanhas(status: str = "", limite: int = 25) -> str:
+    """(ExpansaoPet) Lista campanhas da conta de anúncios. status opcional: ACTIVE, PAUSED, ARCHIVED."""
+    d = _meta_ads_require()
+    params = {"fields": "id,name,status,objective,daily_budget,lifetime_budget",
+              "limit": min(limite, 100)}
+    if status.strip():
+        params["effective_status"] = json.dumps([status.strip().upper()])
+    data = _meta_ads_get(f"{d['ad_account_id']}/campaigns", params)
+    camps = data.get("data", [])
+    if not camps:
+        return "Nenhuma campanha encontrada."
+    linhas = []
+    for c in camps:
+        orc = c.get("daily_budget") or c.get("lifetime_budget")
+        orc_txt = f"R$ {int(orc)/100:.2f}" if orc else "—"
+        linhas.append(f"- [{c['id']}] {c.get('name','?')} | {c.get('status','?')} | "
+                      f"{c.get('objective','?')} | orçamento {orc_txt}")
+    return f"**{len(camps)} campanha(s):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def ads_listar_adsets(campaign_id: str = "", limite: int = 25) -> str:
+    """(ExpansaoPet) Lista os conjuntos de anúncios (ad sets). Sem campaign_id: todos da conta."""
+    d = _meta_ads_require()
+    base = campaign_id.strip() or d["ad_account_id"]
+    data = _meta_ads_get(f"{base}/adsets", {
+        "fields": "id,name,status,daily_budget,optimization_goal,campaign_id",
+        "limit": min(limite, 100)})
+    sets = data.get("data", [])
+    if not sets:
+        return "Nenhum conjunto de anúncios encontrado."
+    linhas = [f"- [{s['id']}] {s.get('name','?')} | {s.get('status','?')} | "
+              f"meta {s.get('optimization_goal','?')}" for s in sets]
+    return f"**{len(sets)} conjunto(s):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def ads_listar_anuncios(adset_id: str = "", limite: int = 25) -> str:
+    """(ExpansaoPet) Lista anúncios individuais. Sem adset_id: todos da conta."""
+    d = _meta_ads_require()
+    base = adset_id.strip() or d["ad_account_id"]
+    data = _meta_ads_get(f"{base}/ads", {
+        "fields": "id,name,status,adset_id,creative", "limit": min(limite, 100)})
+    ads = data.get("data", [])
+    if not ads:
+        return "Nenhum anúncio encontrado."
+    linhas = [f"- [{a['id']}] {a.get('name','?')} | {a.get('status','?')}" for a in ads]
+    return f"**{len(ads)} anúncio(s):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def ads_insights(nivel: str = "campaign", periodo_dias: int = 7) -> str:
+    """(ExpansaoPet) Métricas de desempenho dos anúncios (gasto, impressões, cliques, CTR, CPC,
+    compras/ROAS atribuído pelo Meta via pixel). nivel: account, campaign, adset ou ad.
+    periodo_dias: janela em dias (default 7). Obs: o ROAS aqui depende do pixel/Conversions API
+    estar configurado no site; para o ROAS sobre o faturamento real do Bling use ads_roas_real."""
+    d = _meta_ads_require()
+    nivel = nivel.strip().lower()
+    if nivel not in ("account", "campaign", "adset", "ad"):
+        nivel = "campaign"
+    until = int(time.time()); since = until - max(periodo_dias, 1) * 86400
+    import datetime as _dt
+    rng = json.dumps({"since": _dt.date.fromtimestamp(since).isoformat(),
+                      "until": _dt.date.fromtimestamp(until).isoformat()})
+    data = _meta_ads_get(f"{d['ad_account_id']}/insights", {
+        "level": nivel,
+        "fields": "campaign_name,adset_name,ad_name,spend,impressions,clicks,ctr,cpc,actions,action_values",
+        "time_range": rng, "limit": 100})
+    rows = data.get("data", [])
+    if not rows:
+        return f"Sem dados de insights para os últimos {periodo_dias} dias."
+    linhas = []
+    for r in rows:
+        nome = r.get("campaign_name") or r.get("adset_name") or r.get("ad_name") or "conta"
+        compras = next((a.get("value") for a in r.get("actions", [])
+                        if a.get("action_type") in ("purchase", "omni_purchase")), "0")
+        receita = next((a.get("value") for a in r.get("action_values", [])
+                        if a.get("action_type") in ("purchase", "omni_purchase")), "0")
+        spend = float(r.get("spend", 0) or 0)
+        roas = (float(receita) / spend) if spend else 0
+        linhas.append(f"- {nome}: gasto R$ {spend:.2f} | {r.get('impressions','0')} impr | "
+                      f"{r.get('clicks','0')} cliques | CTR {r.get('ctr','0')}% | CPC R$ {r.get('cpc','0')} | "
+                      f"{compras} compras | ROAS {roas:.2f}")
+    return f"**Insights ({nivel}, {periodo_dias}d):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def ads_roas_real(periodo_dias: int = 7) -> str:
+    """(ExpansaoPet) ROAS REAL = faturamento atendido no Bling ÷ gasto em Ads do Meta, no mesmo
+    período. Diferente do ads_insights (que usa as compras atribuídas pelo pixel), aqui o
+    numerador é a receita real dos pedidos atendidos (idSituacao=9) no Bling — útil quando o
+    pixel não rastreia conversões. periodo_dias: janela em dias (default 7).
+    Atenção: é um ROAS *agregado/blended* (todo o faturamento ÷ todo o gasto), não atribuído por
+    canal — vendas orgânicas e de outras origens também entram no numerador."""
+    from datetime import timedelta
+    dias = max(periodo_dias, 1)
+    d2 = date.today()
+    d1 = d2 - timedelta(days=dias - 1)
+    gasto = _meta_spend_no_periodo(d1, d2)
+    faturamento, n_pedidos = _bling_faturamento_periodo(d1, d2)
+    roas = (faturamento / gasto) if gasto else 0
+    cpa  = (gasto / n_pedidos) if n_pedidos else 0
+    return (
+        f"**ROAS real (blended) — últimos {dias}d ({d1} a {d2})**\n\n"
+        f"- Gasto em Ads (Meta): R$ {gasto:,.2f}\n"
+        f"- Faturamento atendido (Bling): R$ {faturamento:,.2f}  ({n_pedidos} pedidos)\n"
+        f"- **ROAS real: {roas:.2f}x**  (cada R$ 1 em Ads ↔ R$ {roas:,.2f} de faturamento)\n"
+        f"- Custo por pedido (CPA blended): R$ {cpa:,.2f}\n\n"
+        f"_Blended: inclui todo o faturamento do período, não só o atribuído ao Meta. "
+        f"Para o ROAS atribuído pelo pixel, use ads_insights._"
+    )
 
 
 # ── MCP 2024-11-05 compatibility ──────────────────────────────────────────────
