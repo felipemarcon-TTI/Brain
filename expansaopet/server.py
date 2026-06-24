@@ -63,7 +63,7 @@ _users_by_token, _users_by_id = _load_users()
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
 _OPEN_PATHS = frozenset({
-    "/", "/version", "/bling/callback", "/meta/callback",
+    "/", "/version", "/bling/callback", "/meta/callback", "/nuvemshop/callback",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -80,7 +80,7 @@ class _AuthMiddleware:
                 auth = headers.get(b"authorization", b"").decode("latin-1")
                 bearer = auth[7:] if auth.startswith("Bearer ") else ""
 
-                if not bearer and path in ("/bling/auth", "/meta/auth"):
+                if not bearer and path in ("/bling/auth", "/meta/auth", "/nuvemshop/auth"):
                     qs = scope.get("query_string", b"").decode()
                     bearer = dict(_urlparse.parse_qsl(qs)).get("token", "")
 
@@ -284,7 +284,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v6 - 30 tools (observe-only: Bling writes atrás de kill-switch + Meta Ads leitura/ROAS + listar contas)", status_code=200)
+    return HTMLResponse("v7 - 34 tools (observe-only: Bling + Meta Ads leitura/ROAS + Nuvemshop receita por canal + ROAS online)", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -1736,6 +1736,208 @@ def ads_roas_real(periodo_dias: int = 7) -> str:
         f"- Custo por pedido (CPA blended): R$ {cpa:,.2f}\n\n"
         f"_Blended: inclui todo o faturamento do período, não só o atribuído ao Meta. "
         f"Para o ROAS atribuído pelo pixel, use ads_insights._"
+    )
+
+
+# ── Nuvemshop (loja online) — receita por canal, somente leitura ──────────────
+# Lê os pedidos da loja online (Nuvemshop) para separar a receita do canal "store"
+# dos outros (Mercado Livre, PDV, etc.) e cruzar com o gasto do Meta — um ROAS real
+# por canal, mais honesto que o blended sobre todo o faturamento do Bling.
+# Token da Nuvemshop NÃO expira. OAuth mesmo padrão do Meta. Somente leitura.
+
+NUVEMSHOP_APP_ID      = os.environ.get("NUVEMSHOP_CLIENT_ID", "") or os.environ.get("NUVEMSHOP_APP_ID", "")
+NUVEMSHOP_SECRET      = os.environ.get("NUVEMSHOP_CLIENT_SECRET", "")
+NUVEMSHOP_REDIRECT_URI = os.environ.get("NUVEMSHOP_REDIRECT_URI", f"{_BASE_URL}/nuvemshop/callback")
+NUVEMSHOP_TOKEN_URL   = "https://www.nuvemshop.com.br/apps/authorize/token"
+NUVEMSHOP_API         = "https://api.tiendanube.com/v1"
+# User-Agent é OBRIGATÓRIO na API da Nuvemshop (com contato).
+NUVEMSHOP_USER_AGENT  = os.environ.get("NUVEMSHOP_USER_AGENT", "ExpansaoPet Brain (felipe.marcon@thetradeinc.com)")
+
+_nuvemshop_cache: dict | None = None
+
+
+def _nuvemshop_load() -> dict | None:
+    global _nuvemshop_cache
+    if _nuvemshop_cache:
+        return _nuvemshop_cache
+    tok = os.environ.get("NUVEMSHOP_ACCESS_TOKEN", "")
+    if tok:
+        _nuvemshop_cache = {"access_token": tok, "store_id": os.environ.get("NUVEMSHOP_STORE_ID", "")}
+        return _nuvemshop_cache
+    return None
+
+
+def _nuvemshop_save(data: dict) -> None:
+    global _nuvemshop_cache
+    _nuvemshop_cache = data
+    for key, env in [("access_token", "NUVEMSHOP_ACCESS_TOKEN"), ("store_id", "NUVEMSHOP_STORE_ID")]:
+        _railway_upsert_var(env, str(data.get(key, "") or ""))
+
+
+def _nuvemshop_require() -> dict:
+    d = _nuvemshop_load()
+    if not d or not d.get("access_token") or not d.get("store_id"):
+        raise RuntimeError(
+            "Nuvemshop não conectada. Abra /nuvemshop/auth?token=SEU_MCP_AUTH_TOKEN no navegador e autorize.")
+    return d
+
+
+def _nuvemshop_get(path: str, params: dict | None = None) -> tuple[list, dict]:
+    d = _nuvemshop_require()
+    url = f"{NUVEMSHOP_API}/{d['store_id']}/{path.lstrip('/')}"
+    headers = {"Authentication": f"bearer {d['access_token']}",
+               "User-Agent": NUVEMSHOP_USER_AGENT, "Content-Type": "application/json"}
+    r = requests.get(url, headers=headers, params=params or {}, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Nuvemshop API {r.status_code}: {r.text[:300]}")
+    return (r.json() if r.content else []), dict(r.headers)
+
+
+def _nuvemshop_pedidos_periodo(d1, d2) -> list:
+    """Todos os pedidos criados no intervalo [d1, d2], paginando (per_page=200)."""
+    pedidos: list = []
+    pagina = 1
+    while pagina <= 50:  # backstop anti-loop
+        data, _ = _nuvemshop_get("orders", {
+            "created_at_min": f"{d1}T00:00:00-03:00",
+            "created_at_max": f"{d2}T23:59:59-03:00",
+            "per_page": 200, "page": pagina,
+            "fields": "id,total,subtotal,created_at,payment_status,status,storefront"})
+        if not data:
+            break
+        pedidos.extend(data)
+        if len(data) < 200:
+            break
+        pagina += 1
+    return pedidos
+
+
+@mcp.custom_route("/nuvemshop/auth", methods=["GET"])
+async def nuvemshop_auth(request: Request) -> HTMLResponse:
+    if not NUVEMSHOP_APP_ID or not NUVEMSHOP_SECRET:
+        return HTMLResponse("Configure NUVEMSHOP_CLIENT_ID e NUVEMSHOP_CLIENT_SECRET no Railway antes de autenticar.", status_code=400)
+    state = secrets.token_urlsafe(16)
+    _bling_pending_state[state] = "nuvemshop"
+    url = f"https://www.nuvemshop.com.br/apps/{NUVEMSHOP_APP_ID}/authorize?state={state}"
+    return RedirectResponse(url)
+
+
+@mcp.custom_route("/nuvemshop/callback", methods=["GET"])
+async def nuvemshop_callback(request: Request) -> HTMLResponse:
+    code  = request.query_params.get("code")
+    state = request.query_params.get("state", "")
+    if not code:
+        return HTMLResponse("<h2>Erro: code não recebido da Nuvemshop.</h2>", status_code=400)
+    # state é opcional aqui (a instalação pode partir do portal de parceiros); validamos só se nós geramos
+    _bling_pending_state.pop(state, None)
+
+    def _exchange():
+        r = requests.post(NUVEMSHOP_TOKEN_URL, data={
+            "client_id": NUVEMSHOP_APP_ID, "client_secret": NUVEMSHOP_SECRET,
+            "grant_type": "authorization_code", "code": code}, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        return {"access_token": j["access_token"],
+                "store_id": str(j.get("user_id") or j.get("store_id") or "")}
+
+    try:
+        data = await anyio.to_thread.run_sync(_exchange)
+    except Exception as e:
+        return HTMLResponse(f"<h2>Erro ao conectar Nuvemshop:</h2><pre>{str(e)[:500]}</pre>", status_code=500)
+
+    _nuvemshop_save(data)
+    return HTMLResponse(
+        "<body style='font-family:sans-serif;max-width:600px;margin:40px auto'>"
+        "<h2 style='color:green'>Nuvemshop conectada com sucesso!</h2>"
+        f"<p>Loja (store_id): <b>{data['store_id']}</b></p><p>Pode fechar esta aba.</p></body>")
+
+
+@mcp.tool()
+def nuvemshop_conexao_status() -> str:
+    """(ExpansaoPet) Mostra se a loja Nuvemshop está conectada (somente leitura) e qual store_id está em uso."""
+    d = _nuvemshop_load()
+    if not d or not d.get("access_token"):
+        return ("❌ Nuvemshop NÃO conectada. Autorize no navegador:\n"
+                f"{_BASE_URL}/nuvemshop/auth?token=SEU_MCP_AUTH_TOKEN")
+    return f"✅ Nuvemshop conectada (somente leitura) | Loja store_id: {d.get('store_id') or '?'}"
+
+
+@mcp.tool()
+def nuvemshop_receita(periodo_dias: int = 30, somente_pagos: bool = True) -> str:
+    """(ExpansaoPet) Receita da LOJA ONLINE (Nuvemshop) no período, separada por canal (storefront:
+    store = loja própria, meli = Mercado Livre, pos = PDV, etc.). É o denominador certo para o ROAS
+    de mídia — só a receita do canal online, não todo o faturamento do Bling. somente_pagos=True
+    conta apenas pedidos com pagamento confirmado."""
+    from datetime import timedelta
+    dias = max(periodo_dias, 1)
+    d2 = date.today(); d1 = d2 - timedelta(days=dias - 1)
+    pedidos = _nuvemshop_pedidos_periodo(d1, d2)
+    por_canal: dict = {}
+    total_geral = 0.0; n_geral = 0
+    for p in pedidos:
+        if p.get("status") == "cancelled":
+            continue
+        if somente_pagos and p.get("payment_status") != "paid":
+            continue
+        canal = p.get("storefront") or "desconhecido"
+        val = float(p.get("total", 0) or 0)
+        c = por_canal.setdefault(canal, {"total": 0.0, "n": 0})
+        c["total"] += val; c["n"] += 1
+        total_geral += val; n_geral += 1
+    if not pedidos:
+        return f"Sem pedidos na Nuvemshop nos últimos {dias} dias."
+    filtro = "pagos" if somente_pagos else "todos (menos cancelados)"
+    linhas = [f"- **{canal}**: R$ {c['total']:,.2f}  ({c['n']} pedidos)"
+              for canal, c in sorted(por_canal.items(), key=lambda x: -x[1]["total"])]
+    store = por_canal.get("store", {}).get("total", 0.0)
+    return (f"**Receita Nuvemshop — últimos {dias}d ({d1} a {d2}, {filtro})**\n\n"
+            + "\n".join(linhas) +
+            f"\n\n**Total: R$ {total_geral:,.2f} ({n_geral} pedidos)** · "
+            f"canal loja própria (store): R$ {store:,.2f}")
+
+
+@mcp.tool()
+def nuvemshop_listar_pedidos(periodo_dias: int = 7, limite: int = 20) -> str:
+    """(ExpansaoPet) Lista os pedidos recentes da Nuvemshop (id, valor, canal, status de pagamento)."""
+    from datetime import timedelta
+    dias = max(periodo_dias, 1)
+    d2 = date.today(); d1 = d2 - timedelta(days=dias - 1)
+    pedidos = _nuvemshop_pedidos_periodo(d1, d2)
+    if not pedidos:
+        return f"Sem pedidos na Nuvemshop nos últimos {dias} dias."
+    pedidos = sorted(pedidos, key=lambda p: p.get("created_at", ""), reverse=True)[:max(limite, 1)]
+    linhas = [f"- #{p.get('id')} | {(p.get('created_at') or '')[:10]} | R$ {float(p.get('total',0) or 0):,.2f} | "
+              f"{p.get('storefront','?')} | pgto {p.get('payment_status','?')}" for p in pedidos]
+    return f"**{len(linhas)} pedido(s) recentes (Nuvemshop):**\n" + "\n".join(linhas)
+
+
+@mcp.tool()
+def ads_roas_online(periodo_dias: int = 30) -> str:
+    """(ExpansaoPet) ROAS por canal ONLINE = gasto no Meta ÷ receita PAGA da loja própria na Nuvemshop
+    (storefront 'store'), no mesmo período. É o ROAS blended CORRETO: usa só a receita do canal que os
+    anúncios impulsionam, não todo o faturamento do Bling. Requer Meta e Nuvemshop conectados."""
+    from datetime import timedelta
+    dias = max(periodo_dias, 1)
+    d2 = date.today(); d1 = d2 - timedelta(days=dias - 1)
+    gasto = _meta_spend_no_periodo(d1, d2)
+    pedidos = _nuvemshop_pedidos_periodo(d1, d2)
+    receita = 0.0; n = 0
+    for p in pedidos:
+        if p.get("status") == "cancelled" or p.get("payment_status") != "paid":
+            continue
+        if (p.get("storefront") or "") != "store":
+            continue
+        receita += float(p.get("total", 0) or 0); n += 1
+    roas = (receita / gasto) if gasto else 0
+    cpa  = (gasto / n) if n else 0
+    return (
+        f"**ROAS canal online (Meta × loja Nuvemshop) — últimos {dias}d ({d1} a {d2})**\n\n"
+        f"- Gasto em Ads (Meta): R$ {gasto:,.2f}\n"
+        f"- Receita paga da loja online (storefront=store): R$ {receita:,.2f}  ({n} pedidos)\n"
+        f"- **ROAS online: {roas:.2f}x**  ·  CPA: R$ {cpa:,.2f}\n\n"
+        f"_Mais honesto que o blended do Bling: considera só a receita do canal online (não atacado/PDV/"
+        f"marketplace). Ainda assim é canal-nível, não atribuição por campanha — para isso, o ROAS do pixel "
+        f"(ads_insights) + CAPI._"
     )
 
 
