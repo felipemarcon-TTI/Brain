@@ -1787,7 +1787,7 @@ def _nuvemshop_get(path: str, params: dict | None = None) -> tuple[list, dict]:
     url = f"{NUVEMSHOP_API}/{d['store_id']}/{path.lstrip('/')}"
     headers = {"Authentication": f"bearer {d['access_token']}",
                "User-Agent": NUVEMSHOP_USER_AGENT, "Content-Type": "application/json"}
-    r = requests.get(url, headers=headers, params=params or {}, timeout=30)
+    r = requests.get(url, headers=headers, params=params or {}, timeout=60)
     if not r.ok:
         raise RuntimeError(f"Nuvemshop API {r.status_code}: {r.text[:300]}")
     return (r.json() if r.content else []), dict(r.headers)
@@ -1921,11 +1921,13 @@ def ads_roas_online(periodo_dias: int = 30) -> str:
     d2 = date.today(); d1 = d2 - timedelta(days=dias - 1)
     gasto = _meta_spend_no_periodo(d1, d2)
     pedidos = _nuvemshop_pedidos_periodo(d1, d2)
+    # Loja online = todos os storefronts web (store/mobile/form/...), EXCETO marketplace e PDV.
+    NAO_ONLINE = ("meli", "pos")
     receita = 0.0; n = 0
     for p in pedidos:
         if p.get("status") == "cancelled" or p.get("payment_status") != "paid":
             continue
-        if (p.get("storefront") or "") != "store":
+        if (p.get("storefront") or "") in NAO_ONLINE:
             continue
         receita += float(p.get("total", 0) or 0); n += 1
     roas = (receita / gasto) if gasto else 0
@@ -1933,7 +1935,7 @@ def ads_roas_online(periodo_dias: int = 30) -> str:
     return (
         f"**ROAS canal online (Meta × loja Nuvemshop) — últimos {dias}d ({d1} a {d2})**\n\n"
         f"- Gasto em Ads (Meta): R$ {gasto:,.2f}\n"
-        f"- Receita paga da loja online (storefront=store): R$ {receita:,.2f}  ({n} pedidos)\n"
+        f"- Receita paga da loja online (web: store+mobile+form, exceto Mercado Livre/PDV): R$ {receita:,.2f}  ({n} pedidos)\n"
         f"- **ROAS online: {roas:.2f}x**  ·  CPA: R$ {cpa:,.2f}\n\n"
         f"_Mais honesto que o blended do Bling: considera só a receita do canal online (não atacado/PDV/"
         f"marketplace). Ainda assim é canal-nível, não atribuição por campanha — para isso, o ROAS do pixel "
