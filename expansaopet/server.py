@@ -63,7 +63,7 @@ _users_by_token, _users_by_id = _load_users()
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
 _OPEN_PATHS = frozenset({
-    "/", "/version", "/bling/callback", "/meta/callback", "/nuvemshop/callback",
+    "/", "/version", "/bling/callback", "/meta/callback", "/nuvemshop/callback", "/ga4/callback",
     "/.well-known/oauth-authorization-server", "/oauth/authorize", "/oauth/token",
 })
 
@@ -80,7 +80,7 @@ class _AuthMiddleware:
                 auth = headers.get(b"authorization", b"").decode("latin-1")
                 bearer = auth[7:] if auth.startswith("Bearer ") else ""
 
-                if not bearer and path in ("/bling/auth", "/meta/auth", "/nuvemshop/auth"):
+                if not bearer and path in ("/bling/auth", "/meta/auth", "/nuvemshop/auth", "/ga4/auth"):
                     qs = scope.get("query_string", b"").decode()
                     bearer = dict(_urlparse.parse_qsl(qs)).get("token", "")
 
@@ -284,7 +284,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v7 - 34 tools (observe-only: Bling + Meta Ads leitura/ROAS + Nuvemshop receita por canal + ROAS online)", status_code=200)
+    return HTMLResponse("v8 - 37 tools (observe-only: Bling + Meta Ads + Nuvemshop + GA4 trafego/receita por canal)", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -1941,6 +1941,195 @@ def ads_roas_online(periodo_dias: int = 30) -> str:
         f"marketplace). Ainda assim é canal-nível, não atribuição por campanha — para isso, o ROAS do pixel "
         f"(ads_insights) + CAPI._"
     )
+
+
+# ── GA4 (Google Analytics) — tráfego e receita por canal, somente leitura ────
+# Responde "de onde veio cada venda" (Meta pago × orgânico × Google × direto) e
+# visitas/sessões — coisas que Bling/Nuvemshop não têm. Autenticação via OAuth com
+# a conta que JÁ tem acesso ao GA4 (sem conta de serviço / sem chave). Read-only.
+
+GA4_CLIENT_ID     = os.environ.get("GA4_CLIENT_ID", "")
+GA4_CLIENT_SECRET = os.environ.get("GA4_CLIENT_SECRET", "")
+GA4_REDIRECT_URI  = os.environ.get("GA4_REDIRECT_URI", f"{_BASE_URL}/ga4/callback")
+GA4_PROPERTY_ID   = os.environ.get("GA4_PROPERTY_ID", "")
+GA4_SCOPE         = "https://www.googleapis.com/auth/analytics.readonly"
+GA4_DATA_API      = "https://analyticsdata.googleapis.com/v1beta"
+GA4_TOKEN_URL     = "https://oauth2.googleapis.com/token"
+
+_ga4_cache: dict | None = None
+_ga4_token_cache = {"access_token": "", "exp": 0.0}
+
+
+def _ga4_load() -> dict | None:
+    global _ga4_cache
+    if _ga4_cache:
+        return _ga4_cache
+    rt = os.environ.get("GA4_REFRESH_TOKEN", "")
+    if rt:
+        _ga4_cache = {"refresh_token": rt}
+        return _ga4_cache
+    return None
+
+
+def _ga4_save(data: dict) -> None:
+    global _ga4_cache
+    _ga4_cache = data
+    _railway_upsert_var("GA4_REFRESH_TOKEN", data.get("refresh_token", "") or "")
+
+
+def _ga4_require() -> dict:
+    d = _ga4_load()
+    if not d or not d.get("refresh_token"):
+        raise RuntimeError("GA4 não conectado. Abra /ga4/auth?token=SEU_MCP_AUTH_TOKEN no navegador e autorize.")
+    if not GA4_PROPERTY_ID:
+        raise RuntimeError("GA4_PROPERTY_ID não configurado no Railway (o número da propriedade GA4).")
+    return d
+
+
+def _ga4_access_token() -> str:
+    if _ga4_token_cache["access_token"] and _ga4_token_cache["exp"] > time.time() + 60:
+        return _ga4_token_cache["access_token"]
+    d = _ga4_require()
+    r = requests.post(GA4_TOKEN_URL, data={
+        "client_id": GA4_CLIENT_ID, "client_secret": GA4_CLIENT_SECRET,
+        "refresh_token": d["refresh_token"], "grant_type": "refresh_token"}, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"GA4 OAuth {r.status_code}: {r.text[:300]}")
+    j = r.json()
+    _ga4_token_cache["access_token"] = j["access_token"]
+    _ga4_token_cache["exp"] = time.time() + int(j.get("expires_in", 3600))
+    return _ga4_token_cache["access_token"]
+
+
+def _ga4_run_report(body: dict) -> dict:
+    token = _ga4_access_token()
+    url = f"{GA4_DATA_API}/properties/{GA4_PROPERTY_ID}:runReport"
+    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=body, timeout=60)
+    if not r.ok:
+        raise RuntimeError(f"GA4 Data API {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+@mcp.custom_route("/ga4/auth", methods=["GET"])
+async def ga4_auth(request: Request) -> HTMLResponse:
+    if not GA4_CLIENT_ID or not GA4_CLIENT_SECRET:
+        return HTMLResponse("Configure GA4_CLIENT_ID e GA4_CLIENT_SECRET no Railway antes de autenticar.", status_code=400)
+    state = secrets.token_urlsafe(16)
+    _bling_pending_state[state] = "ga4"
+    params = {
+        "client_id": GA4_CLIENT_ID, "redirect_uri": GA4_REDIRECT_URI,
+        "response_type": "code", "scope": GA4_SCOPE,
+        "access_type": "offline", "prompt": "consent", "state": state,
+    }
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + _urlparse.urlencode(params)
+    return RedirectResponse(url)
+
+
+@mcp.custom_route("/ga4/callback", methods=["GET"])
+async def ga4_callback(request: Request) -> HTMLResponse:
+    code  = request.query_params.get("code")
+    state = request.query_params.get("state", "")
+    err   = request.query_params.get("error")
+    if err:
+        return HTMLResponse(f"<h2>Erro GA4:</h2><p>{err}</p>", status_code=400)
+    if not code:
+        return HTMLResponse("<h2>Erro: code não recebido do Google.</h2>", status_code=400)
+    if state and state not in _bling_pending_state:
+        return HTMLResponse("<h2>Erro: estado inválido (possível CSRF).</h2>", status_code=400)
+    _bling_pending_state.pop(state, None)
+
+    def _exchange():
+        r = requests.post(GA4_TOKEN_URL, data={
+            "client_id": GA4_CLIENT_ID, "client_secret": GA4_CLIENT_SECRET,
+            "code": code, "redirect_uri": GA4_REDIRECT_URI,
+            "grant_type": "authorization_code"}, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        if not j.get("refresh_token"):
+            raise RuntimeError("Google não retornou refresh_token. Refaça a autorização (o app precisa de access_type=offline + prompt=consent).")
+        return {"refresh_token": j["refresh_token"]}
+
+    try:
+        data = await anyio.to_thread.run_sync(_exchange)
+    except Exception as e:
+        return HTMLResponse(f"<h2>Erro ao conectar GA4:</h2><pre>{str(e)[:500]}</pre>", status_code=500)
+
+    _ga4_save(data)
+    return HTMLResponse(
+        "<body style='font-family:sans-serif;max-width:600px;margin:40px auto'>"
+        "<h2 style='color:green'>GA4 conectado com sucesso!</h2>"
+        f"<p>Propriedade: <b>{GA4_PROPERTY_ID or '⚠️ defina GA4_PROPERTY_ID no Railway'}</b></p>"
+        "<p>Pode fechar esta aba.</p></body>")
+
+
+@mcp.tool()
+def ga4_conexao_status() -> str:
+    """(ExpansaoPet) Mostra se o GA4 está conectado (somente leitura) e qual propriedade está em uso."""
+    d = _ga4_load()
+    if not d or not d.get("refresh_token"):
+        return ("❌ GA4 NÃO conectado. Autorize no navegador:\n"
+                f"{_BASE_URL}/ga4/auth?token=SEU_MCP_AUTH_TOKEN")
+    prop = GA4_PROPERTY_ID or "⚠️ GA4_PROPERTY_ID não definido no Railway"
+    return f"✅ GA4 conectado (somente leitura) | Propriedade: {prop}"
+
+
+@mcp.tool()
+def ga4_por_canal(periodo_dias: int = 30) -> str:
+    """(ExpansaoPet) Tráfego e receita POR CANAL/ORIGEM no GA4 (Direto, Busca orgânica, Social pago,
+    Social orgânico, Google pago, E-mail, Referência...). Mostra visitantes, sessões, compras, receita
+    e taxa de conversão por canal — responde 'de onde veio cada venda'. periodo_dias: janela (default 30)."""
+    from datetime import timedelta
+    dias = max(periodo_dias, 1)
+    d2 = date.today(); d1 = d2 - timedelta(days=dias - 1)
+    _ga4_require()
+    data = _ga4_run_report({
+        "dateRanges": [{"startDate": str(d1), "endDate": str(d2)}],
+        "dimensions": [{"name": "sessionDefaultChannelGroup"}],
+        "metrics": [{"name": "sessions"}, {"name": "totalUsers"},
+                    {"name": "ecommercePurchases"}, {"name": "purchaseRevenue"}],
+        "orderBys": [{"metric": {"metricName": "purchaseRevenue"}, "desc": True}],
+        "limit": 50})
+    rows = data.get("rows", [])
+    if not rows:
+        return f"Sem dados no GA4 nos últimos {dias} dias."
+    linhas = []
+    ts = tu = tp = 0; tr = 0.0
+    for r in rows:
+        canal = r["dimensionValues"][0]["value"]
+        mv = r["metricValues"]
+        s = int(mv[0]["value"] or 0); u = int(mv[1]["value"] or 0)
+        p = int(mv[2]["value"] or 0); rev = float(mv[3]["value"] or 0)
+        cr = (p / s * 100) if s else 0
+        linhas.append(f"- **{canal}**: {u} visitantes · {s} sessões · {p} compras · R$ {rev:,.2f} · conv {cr:.1f}%")
+        ts += s; tu += u; tp += p; tr += rev
+    crt = (tp / ts * 100) if ts else 0
+    return (f"**GA4 por canal — últimos {dias}d ({d1} a {d2})**\n\n" + "\n".join(linhas) +
+            f"\n\n**Total: {tu} visitantes · {ts} sessões · {tp} compras · R$ {tr:,.2f} · conv {crt:.1f}%**\n"
+            f"_Visitantes somados por canal podem se sobrepor (um usuário pode vir por mais de um canal)._")
+
+
+@mcp.tool()
+def ga4_visao_geral(periodo_dias: int = 30) -> str:
+    """(ExpansaoPet) Visão geral do GA4 no período: visitantes únicos, sessões, compras, receita e
+    taxa de conversão geral da loja online. periodo_dias: janela (default 30)."""
+    from datetime import timedelta
+    dias = max(periodo_dias, 1)
+    d2 = date.today(); d1 = d2 - timedelta(days=dias - 1)
+    _ga4_require()
+    data = _ga4_run_report({
+        "dateRanges": [{"startDate": str(d1), "endDate": str(d2)}],
+        "metrics": [{"name": "totalUsers"}, {"name": "sessions"},
+                    {"name": "ecommercePurchases"}, {"name": "purchaseRevenue"}]})
+    rows = data.get("rows", [])
+    if not rows:
+        return f"Sem dados no GA4 nos últimos {dias} dias."
+    mv = rows[0]["metricValues"]
+    u = int(mv[0]["value"] or 0); s = int(mv[1]["value"] or 0)
+    p = int(mv[2]["value"] or 0); rev = float(mv[3]["value"] or 0)
+    cr = (p / s * 100) if s else 0
+    return (f"**GA4 — visão geral ({dias}d, {d1} a {d2})**\n\n"
+            f"- Visitantes únicos: {u:,}\n- Sessões: {s:,}\n- Compras: {p:,}\n"
+            f"- Receita: R$ {rev:,.2f}\n- Taxa de conversão: {cr:.2f}%")
 
 
 # ── MCP 2024-11-05 compatibility ──────────────────────────────────────────────
