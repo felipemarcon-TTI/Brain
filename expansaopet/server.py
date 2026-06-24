@@ -14,7 +14,7 @@ import anyio
 import requests
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 _token_refresh_lock = threading.Lock()
 
@@ -284,7 +284,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v9 - 38 tools (observe-only: Bling +faturamento sem outliers + Meta Ads + Nuvemshop + GA4)", status_code=200)
+    return HTMLResponse("v10 - 40 tools (observe-only: Bling + export base clientes/reativacao + Meta Ads + Nuvemshop + GA4)", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -616,6 +616,256 @@ def relatorio_mais_vendidos_bling(data_inicio: str = "2026-01-01", data_fim: str
         linhas.append(row)
 
     return chr(10).join(linhas)
+
+
+# ── Exportacao de base de clientes (reativacao) ──────────────────────────────
+# SOMENTE LEITURA. Agrega RFM de todos os clientes via pedidos, filtra inativos,
+# enriquece os top-N com contato completo (email/UF/CPF) + produto, deduplica por
+# CPF/CNPJ e gera um CSV baixavel. Roda em background p/ nao estourar timeout.
+
+_EXPORT_DIR = Path(os.environ.get("EXPORT_DIR", "/tmp/expansaopet-exports"))
+_export_jobs: dict = {}      # job_id -> {status, progress, file, url, resumo, error}
+_export_tokens: dict = {}    # token  -> Path do CSV
+
+
+def _csv_dias_desde(d: str, hoje) -> int:
+    try:
+        from datetime import date as _date
+        y, m, da = (int(x) for x in d[:10].split("-"))
+        return (hoje - _date(y, m, da)).days
+    except Exception:
+        return 99999
+
+
+def _run_export_clientes(job_id: str, dias_inativos: int, enriquecer_top: int,
+                         incluir_produto: bool, situacao: int, periodo_dias: int) -> None:
+    import csv as _csv
+    import re as _re
+    from datetime import date as _date, timedelta as _timedelta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    try:
+        hoje = _date.today()
+        data_ini = str(hoje - _timedelta(days=periodo_dias))
+        data_fim = str(hoje)
+
+        # 1) RFM por contato.id a partir da LISTA de pedidos (barato, ~1 chamada/pagina)
+        _export_jobs[job_id]["progress"] = "lendo pedidos..."
+        agg: dict = {}
+        pagina = 1
+        while True:
+            params = {"pagina": pagina, "limite": 100,
+                      "dataInicial": data_ini, "dataFinal": data_fim}
+            if situacao:
+                params["idSituacao"] = situacao
+            data = _bling_get("/pedidos/vendas", params).get("data", [])
+            if not data:
+                break
+            for p in data:
+                c = p.get("contato") or {}
+                cid = c.get("id") or c.get("nome")
+                if not cid:
+                    continue
+                dt = (p.get("data") or "")[:10]
+                val = float(p.get("total") or p.get("totalProdutos") or 0)
+                a = agg.setdefault(cid, {"id": c.get("id"), "nome": c.get("nome", "?"),
+                                         "num": 0, "total": 0.0, "last": "", "last_val": 0.0,
+                                         "orders": []})
+                a["num"] += 1
+                a["total"] += val
+                a["orders"].append(p.get("id"))
+                if dt > a["last"]:
+                    a["last"] = dt
+                    a["last_val"] = val
+            if len(data) < 100:
+                break
+            pagina += 1
+
+        # 2) filtra inativos e ordena por valor
+        inativos = []
+        for a in agg.values():
+            di = _csv_dias_desde(a["last"], hoje)
+            if di > dias_inativos:
+                a["dias"] = di
+                inativos.append(a)
+        inativos.sort(key=lambda x: x["total"], reverse=True)
+        top = inativos[:enriquecer_top] if enriquecer_top > 0 else inativos
+        _export_jobs[job_id]["progress"] = f"{len(inativos)} inativos; enriquecendo top {len(top)}..."
+
+        # 3) detalhe de contato (email/tel/cpf/uf/cidade) p/ top N
+        def _det(a):
+            try:
+                d = _bling_get(f"/contatos/{a['id']}").get("data", {}) if a.get("id") else {}
+            except Exception:
+                d = {}
+            end = (d.get("endereco") or {}).get("geral") or {}
+            a["email"] = d.get("email") or ""
+            a["tel"] = d.get("celular") or d.get("telefone") or ""
+            a["doc"] = (d.get("numeroDocumento") or "").strip()
+            a["uf"] = end.get("uf") or ""
+            a["cidade"] = end.get("municipio") or ""
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(as_completed([ex.submit(_det, a) for a in top if a.get("id")]))
+
+        # 3b) produto mais comprado p/ top N (detalhe de cada pedido)
+        if incluir_produto:
+            _export_jobs[job_id]["progress"] = f"produtos dos top {len(top)}..."
+
+            def _prod(a):
+                tally: dict = {}
+                for oid in a["orders"]:
+                    try:
+                        ped = _bling_get(f"/pedidos/vendas/{oid}").get("data", {})
+                    except Exception:
+                        continue
+                    for it in ped.get("itens", []):
+                        nm = (it.get("produto") or {}).get("nome") or it.get("descricao") or "?"
+                        tally[nm] = tally.get(nm, 0) + float(it.get("quantidade", 0))
+                ranked = sorted(tally.items(), key=lambda x: -x[1])
+                a["prod1"] = ranked[0][0] if ranked else ""
+                a["top3"] = "; ".join(n for n, _ in ranked[:3])
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(as_completed([ex.submit(_prod, a) for a in top]))
+
+        # 4) dedup por CPF/CNPJ (entre os enriquecidos com documento)
+        by_doc: dict = {}
+        merged_count = 0
+        for a in top:
+            doc = a.get("doc", "")
+            if doc and doc in by_doc:
+                b = by_doc[doc]
+                b["num"] += a["num"]
+                b["total"] += a["total"]
+                b["merged"] = b.get("merged", 1) + 1
+                merged_count += 1
+                a["_dup"] = True
+                if a["last"] > b["last"]:
+                    b["last"], b["last_val"], b["dias"] = a["last"], a["last_val"], a["dias"]
+            elif doc:
+                by_doc[doc] = a
+
+        # 5) classificacao + CSV
+        b2b = _re.compile(r"(LTDA|EIRELI|\bEPP\b|IMPORT|EXPORT|COMERC|COM[EÉ]RC|DISTRIBUID|"
+                          r"ATACAD|AGROPEC|PET\s?SHOP|INDUSTRI|MERCAD|RA[CÇ][OÕ]ES|LOJA\b|"
+                          r"\bS/?A\b|\s-\s?ME\b|\bME$)", _re.I)
+
+        def _rec(d):
+            return "Quente" if d <= 120 else "Morno" if d <= 180 else "Frio" if d <= 270 else "Perdido"
+
+        def _tv(t):
+            return "A" if t >= 2000 else "B" if t >= 500 else "C" if t >= 150 else "D"
+
+        def _prio(rec, tv):
+            s = {"Quente": 0, "Morno": 1, "Frio": 2, "Perdido": 3}[rec] + {"A": 0, "B": 1, "C": 2, "D": 3}[tv]
+            return min(5, s + 1)
+
+        def _canal(rec, tv):
+            if tv in ("A", "B") and rec in ("Quente", "Morno"):
+                return "WhatsApp/Ligacao pessoal"
+            if rec in ("Quente", "Morno"):
+                return "E-mail + cupom"
+            return "Campanha em massa"
+
+        _EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_urlsafe(12)
+        fpath = _EXPORT_DIR / f"clientes_{token}.csv"
+        cols = ["prioridade", "recencia", "tier_valor", "tipo_cliente", "nome",
+                "cpf_cnpj", "email", "telefone", "uf", "cidade",
+                "dias_inativo", "data_ultimo_pedido", "num_pedidos", "total_gasto",
+                "ticket_medio", "valor_ultimo_pedido", "produto_mais_comprado",
+                "top3_produtos", "canal_sugerido", "cadastros_unificados",
+                "id_bling", "status_contato", "responsavel", "observacoes"]
+
+        n_email = n_uf = n_tel = n_linhas = 0
+        with open(fpath, "w", newline="", encoding="utf-8-sig") as fh:
+            w = _csv.writer(fh)
+            w.writerow(cols)
+            for a in inativos:
+                if a.get("_dup"):
+                    continue  # fundido em outro cadastro por CPF/CNPJ
+                rec = _rec(a["dias"])
+                tv = _tv(a["total"])
+                nome = a.get("nome", "?")
+                doc = a.get("doc", "")
+                so_digitos = _re.sub(r"\D", "", doc)
+                tipo = "B2B" if (b2b.search(nome) or len(so_digitos) == 14) else "Varejo"
+                ticket = a["total"] / a["num"] if a["num"] else 0
+                email, uf, tel = a.get("email", ""), a.get("uf", ""), a.get("tel", "")
+                n_email += 1 if email else 0
+                n_uf += 1 if uf else 0
+                n_tel += 1 if tel else 0
+                n_linhas += 1
+                w.writerow([
+                    _prio(rec, tv), rec, tv, tipo, nome, doc, email, tel, uf, a.get("cidade", ""),
+                    a["dias"], a["last"], a["num"], f"{a['total']:.2f}", f"{ticket:.2f}",
+                    f"{a['last_val']:.2f}", a.get("prod1", ""), a.get("top3", ""),
+                    _canal(rec, tv), a.get("merged", 1), a.get("id", ""), "", "", "",
+                ])
+
+        _export_tokens[token] = fpath
+        _export_jobs[job_id].update({
+            "status": "done",
+            "file": str(fpath),
+            "url": f"{_BASE_URL}/export/{token}",
+            "resumo": {"inativos": len(inativos), "linhas_csv": n_linhas,
+                       "enriquecidos": len(top), "merges_dedup": merged_count,
+                       "com_email": n_email, "com_uf": n_uf, "com_telefone": n_tel},
+        })
+    except Exception as e:  # noqa: BLE001
+        _export_jobs[job_id].update({"status": "error", "error": str(e)})
+
+
+@mcp.tool()
+def exportar_base_clientes(dias_inativos: int = 90, enriquecer_top: int = 344,
+                           incluir_produto: bool = True, situacao: int = 9,
+                           periodo_dias: int = 365) -> str:
+    """(ExpansaoPet) SOMENTE LEITURA. Gera um CSV de reativacao da base de clientes.
+    Agrega RFM (recencia/frequencia/monetario) de TODOS os clientes via pedidos (chave = ID do
+    contato), filtra inativos (> dias_inativos sem comprar), enriquece os top N por valor com
+    contato completo (email, telefone, UF, cidade, CPF/CNPJ) deduplicando por CPF/CNPJ, e adiciona
+    o produto mais comprado. Roda em BACKGROUND (pode levar minutos): retorna um job_id; acompanhe
+    com status_exportacao(job_id). NAO escreve no Bling e NAO despeja PII no chat — entrega um link
+    de download do CSV."""
+    job_id = secrets.token_urlsafe(8)
+    _export_jobs[job_id] = {"status": "running", "progress": "iniciando"}
+    threading.Thread(
+        target=_run_export_clientes,
+        args=(job_id, dias_inativos, enriquecer_top, incluir_produto, situacao, periodo_dias),
+        daemon=True,
+    ).start()
+    return (f"Exportacao iniciada em background (job_id: {job_id}). "
+            f"Use status_exportacao('{job_id}') para ver o progresso e pegar o link do CSV.")
+
+
+@mcp.tool()
+def status_exportacao(job_id: str) -> str:
+    """(ExpansaoPet) Status/resultado de uma exportacao iniciada por exportar_base_clientes."""
+    j = _export_jobs.get(job_id)
+    if not j:
+        return f"Job {job_id} nao encontrado."
+    if j["status"] == "running":
+        return f"Em andamento: {j.get('progress', '...')}"
+    if j["status"] == "error":
+        return f"Erro: {j.get('error')}"
+    r = j["resumo"]
+    return (
+        "Concluido!\n"
+        f"- Inativos: {r['inativos']} | linhas no CSV: {r['linhas_csv']}\n"
+        f"- Enriquecidos (top): {r['enriquecidos']} | fusoes por CPF/CNPJ: {r['merges_dedup']}\n"
+        f"- Preenchimento nos enriquecidos -> email: {r['com_email']} | "
+        f"telefone: {r['com_telefone']} | UF: {r['com_uf']}\n"
+        f"- Download CSV: {j['url']}"
+    )
+
+
+@mcp.custom_route("/export/{token}", methods=["GET"])
+async def export_download(request: Request) -> Response:
+    token = request.path_params.get("token", "")
+    p = _export_tokens.get(token)
+    if not p or not Path(p).exists():
+        return HTMLResponse("Arquivo nao encontrado ou expirado.", status_code=404)
+    return FileResponse(str(p), filename=Path(p).name, media_type="text/csv")
+
 
 @mcp.tool()
 def consultar_estoque_bling(id_produto: int) -> str:
