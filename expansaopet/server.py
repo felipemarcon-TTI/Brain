@@ -287,7 +287,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v10 - 40 tools (observe-only: Bling + export base clientes/reativacao + Meta Ads + Nuvemshop + GA4)", status_code=200)
+    return HTMLResponse("v11 - 42 tools (observe-only: Bling + reativacao base_rfm/enriquecer_lote + Meta Ads + Nuvemshop + GA4)", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -868,6 +868,163 @@ async def export_download(request: Request) -> Response:
     if not p or not Path(p).exists():
         return HTMLResponse("Arquivo nao encontrado ou expirado.", status_code=404)
     return FileResponse(str(p), filename=Path(p).name, media_type="text/csv")
+
+
+# ── Reativacao: base RFM + enriquecimento em lotes (resiliente a restart) ─────
+# Substitui o job em background (que morria nos restarts de ~40s). Aqui a
+# paginacao roda 1x (reativacao_base_rfm) e o enriquecimento vai em lotes curtos
+# que RETORNAM as linhas direto (sem arquivo efemero, sem corrida de download).
+
+@mcp.tool()
+def reativacao_base_rfm(situacao: int = 9, periodo_dias: int = 365, dias_inativos: int = 90) -> str:
+    """(ExpansaoPet) SOMENTE LEITURA. Etapa 1 da exportacao de reativacao: pagina /pedidos/vendas,
+    agrega RFM por contato.id, filtra inativos (> dias_inativos sem comprar) e retorna UMA LINHA por
+    cliente inativo, ordenado por valor desc, no formato pipe:
+      id|nome|num_pedidos|total|ultimo_pedido|dias_inativo|valor_ultimo|orders
+    (orders = IDs de pedido separados por virgula, usados depois p/ o produto). Chamada curta (~24s).
+    Use junto com reativacao_enriquecer_lote() para montar o CSV completo em lotes."""
+    from datetime import date as _date, timedelta as _timedelta
+    hoje = _date.today()
+    data_ini = str(hoje - _timedelta(days=periodo_dias))
+    data_fim = str(hoje)
+    agg: dict = {}
+    pagina = 1
+    while True:
+        params = {"pagina": pagina, "limite": 100, "dataInicial": data_ini, "dataFinal": data_fim}
+        if situacao:
+            params["idSituacao"] = situacao
+        data = _bling_get("/pedidos/vendas", params).get("data", [])
+        if not data:
+            break
+        for p in data:
+            c = p.get("contato") or {}
+            cid = c.get("id") or c.get("nome")
+            if not cid:
+                continue
+            dt = (p.get("data") or "")[:10]
+            val = float(p.get("total") or p.get("totalProdutos") or 0)
+            a = agg.setdefault(cid, {"id": c.get("id"), "nome": c.get("nome", "?"),
+                                     "num": 0, "total": 0.0, "last": "", "last_val": 0.0, "orders": []})
+            a["num"] += 1
+            a["total"] += val
+            if p.get("id"):
+                a["orders"].append(str(p.get("id")))
+            if dt > a["last"]:
+                a["last"] = dt
+                a["last_val"] = val
+        if len(data) < 100:
+            break
+        pagina += 1
+
+    inativos = []
+    for a in agg.values():
+        di = _csv_dias_desde(a["last"], hoje)
+        if di > dias_inativos:
+            a["dias"] = di
+            inativos.append(a)
+    inativos.sort(key=lambda x: x["total"], reverse=True)
+
+    linhas = [f"# {len(inativos)} inativos | id|nome|num|total|ultimo|dias|valor_ultimo|orders"]
+    for a in inativos:
+        nome = str(a["nome"]).replace("|", "/")
+        linhas.append(f"{a['id']}|{nome}|{a['num']}|{a['total']:.2f}|{a['last']}|"
+                      f"{a['dias']}|{a['last_val']:.2f}|{','.join(a['orders'])}")
+    return "\n".join(linhas)
+
+
+@mcp.tool()
+def reativacao_enriquecer_lote(linhas_json: str, incluir_produto: bool = False) -> str:
+    """(ExpansaoPet) SOMENTE LEITURA. Etapa 2: recebe um LOTE (JSON array) de clientes vindos de
+    reativacao_base_rfm e retorna as linhas CSV finais ENRIQUECIDAS (contato: email/telefone/CPF/UF/
+    cidade; e, se incluir_produto=True, produto mais comprado + top3 a partir dos orders).
+    Cada item: {"id_global":1,"id":123,"nome":"...","num":3,"total":900.0,"last":"2026-03-01",
+    "dias":110,"last_val":120.0,"orders":[111,222]}. Retorna CSV SEM cabecalho, 25 colunas, uma
+    linha por cliente. Use lotes curtos (~24 com produto, ~70 so contato) p/ caber na janela."""
+    import json as _json
+    import csv as _csv
+    import io as _io
+    import re as _re
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    try:
+        registros = _json.loads(linhas_json)
+    except Exception as e:  # noqa: BLE001
+        return f"ERRO: linhas_json invalido: {e}"
+    if not isinstance(registros, list):
+        return "ERRO: linhas_json deve ser uma lista JSON."
+
+    b2b = _re.compile(r"(LTDA|EIRELI|\bEPP\b|IMPORT|EXPORT|COMERC|COM[EÉ]RC|DISTRIBUID|ATACAD|"
+                      r"AGROPEC|PET\s?SHOP|INDUSTRI|MERCAD|RA[CÇ][OÕ]ES|LOJA\b|\bS/?A\b|\s-\s?ME\b|\bME$)", _re.I)
+
+    def _rec(d):
+        return "Quente" if d <= 120 else "Morno" if d <= 180 else "Frio" if d <= 270 else "Perdido"
+
+    def _tv(t):
+        return "A" if t >= 2000 else "B" if t >= 500 else "C" if t >= 150 else "D"
+
+    def _prio(rec, tv):
+        s = {"Quente": 0, "Morno": 1, "Frio": 2, "Perdido": 3}[rec] + {"A": 0, "B": 1, "C": 2, "D": 3}[tv]
+        return min(5, s + 1)
+
+    def _canal(rec, tv):
+        if tv in ("A", "B") and rec in ("Quente", "Morno"):
+            return "WhatsApp/Ligacao pessoal"
+        if rec in ("Quente", "Morno"):
+            return "E-mail + cupom"
+        return "Campanha em massa"
+
+    def _enriquecer(r):
+        cid = r.get("id")
+        try:
+            d = _bling_get(f"/contatos/{cid}").get("data", {}) if cid else {}
+        except Exception:
+            d = {}
+        end = (d.get("endereco") or {}).get("geral") or {}
+        r["_email"] = d.get("email") or ""
+        r["_tel"] = d.get("celular") or d.get("telefone") or ""
+        r["_doc"] = (d.get("numeroDocumento") or "").strip()
+        r["_uf"] = end.get("uf") or ""
+        r["_cidade"] = end.get("municipio") or ""
+        r["_prod1"] = ""
+        r["_top3"] = ""
+        if incluir_produto:
+            tally: dict = {}
+            for oid in (r.get("orders") or []):
+                try:
+                    ped = _bling_get(f"/pedidos/vendas/{oid}").get("data", {})
+                except Exception:
+                    continue
+                for it in ped.get("itens", []):
+                    nm = (it.get("produto") or {}).get("nome") or it.get("descricao") or "?"
+                    tally[nm] = tally.get(nm, 0) + float(it.get("quantidade", 0))
+            ranked = sorted(tally.items(), key=lambda x: -x[1])
+            r["_prod1"] = ranked[0][0] if ranked else ""
+            r["_top3"] = "; ".join(n for n, _ in ranked[:3])
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(as_completed([ex.submit(_enriquecer, r) for r in registros]))
+
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    for r in registros:
+        dias = int(r.get("dias", 99999))
+        total = float(r.get("total", 0))
+        num = int(r.get("num", 0))
+        rec = _rec(dias)
+        tv = _tv(total)
+        nome = r.get("nome", "?")
+        doc = r.get("_doc", "")
+        so_dig = _re.sub(r"\D", "", doc)
+        tipo = "B2B" if (b2b.search(str(nome)) or len(so_dig) == 14) else "Varejo"
+        ticket = total / num if num else 0
+        w.writerow([
+            r.get("id_global", ""), _prio(rec, tv), rec, tv, tipo, nome, doc,
+            r.get("_email", ""), r.get("_tel", ""), r.get("_uf", ""), r.get("_cidade", ""),
+            dias, r.get("last", ""), num, f"{total:.2f}", f"{ticket:.2f}",
+            f"{float(r.get('last_val', 0) or 0):.2f}", r.get("_prod1", ""), r.get("_top3", ""),
+            _canal(rec, tv), 1, r.get("id", ""), "", "", "",
+        ])
+    return buf.getvalue()
 
 
 @mcp.tool()
