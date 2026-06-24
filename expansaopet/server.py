@@ -80,7 +80,10 @@ class _AuthMiddleware:
                 auth = headers.get(b"authorization", b"").decode("latin-1")
                 bearer = auth[7:] if auth.startswith("Bearer ") else ""
 
-                if not bearer and path in ("/bling/auth", "/meta/auth", "/nuvemshop/auth", "/ga4/auth"):
+                if not bearer and (path in ("/bling/auth", "/meta/auth", "/nuvemshop/auth", "/ga4/auth")
+                                   or path.startswith("/export/")):
+                    # /export/{token}: download do CSV exige o token do MCP (continua autenticado,
+                    # PII protegida) mas aceita via ?token= para uso no browser/curl pelo time.
                     qs = scope.get("query_string", b"").decode()
                     bearer = dict(_urlparse.parse_qsl(qs)).get("token", "")
 
