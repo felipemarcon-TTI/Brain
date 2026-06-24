@@ -284,7 +284,7 @@ async def health_check(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/version", methods=["GET"])
 async def version(request: Request) -> HTMLResponse:
-    return HTMLResponse("v8 - 37 tools (observe-only: Bling + Meta Ads + Nuvemshop + GA4 trafego/receita por canal)", status_code=200)
+    return HTMLResponse("v9 - 38 tools (observe-only: Bling +faturamento sem outliers + Meta Ads + Nuvemshop + GA4)", status_code=200)
 
 
 # ── MCP OAuth2 (para claude.ai browser connector) ────────────────────────────
@@ -1736,6 +1736,64 @@ def ads_roas_real(periodo_dias: int = 7) -> str:
         f"- Custo por pedido (CPA blended): R$ {cpa:,.2f}\n\n"
         f"_Blended: inclui todo o faturamento do período, não só o atribuído ao Meta. "
         f"Para o ROAS atribuído pelo pixel, use ads_insights._"
+    )
+
+
+# ── Bling — faturamento robusto (sem outliers de valor) ──────────────────────
+
+def _bling_valores_pedidos_periodo(d1, d2) -> list:
+    """Valores (totalProdutos) dos pedidos atendidos (idSituacao=9) no intervalo, paginado."""
+    params = {"dataInicial": str(d1), "dataFinal": str(d2), "idSituacao": 9, "pagina": 1, "limite": 100}
+    vals, pag = [], 1
+    while pag <= 200:  # backstop
+        params["pagina"] = pag
+        pedidos = _bling_get("/pedidos/vendas", params).get("data", [])
+        if not pedidos:
+            break
+        for p in pedidos:
+            vals.append(float(p.get("totalProdutos", 0) or 0))
+        if len(pedidos) < 100:
+            break
+        pag += 1
+    return vals
+
+
+@mcp.tool()
+def bling_faturamento_sem_outliers(periodo_dias: int = 90) -> str:
+    """(ExpansaoPet) Faturamento atendido (idSituacao=9) COM e SEM outliers de valor por pedido.
+    Remove pedidos atípicos de valor muito alto (ex.: atacado/grandes lotes) pelo critério de Tukey
+    (> Q3 + 1.5×IQR), revelando o fluxo de varejo 'típico'. Mostra bruto, sem outliers, nº/valor dos
+    outliers, ticket médio/mediana e média mensal. periodo_dias: default 90."""
+    from datetime import timedelta
+    dias = max(periodo_dias, 1)
+    d2 = date.today(); d1 = d2 - timedelta(days=dias - 1)
+    vs = sorted(_bling_valores_pedidos_periodo(d1, d2))
+    n = len(vs)
+    if not n:
+        return f"Sem pedidos atendidos no Bling nos últimos {dias} dias."
+
+    def _pct(p):
+        k = (n - 1) * p
+        f = int(k); c = min(f + 1, n - 1)
+        return vs[f] + (vs[c] - vs[f]) * (k - f)
+
+    q1, med, q3 = _pct(0.25), _pct(0.5), _pct(0.75)
+    limiar = q3 + 1.5 * (q3 - q1)
+    normais = [v for v in vs if v <= limiar]
+    outliers = [v for v in vs if v > limiar]
+    total, total_norm, total_out = sum(vs), sum(normais), sum(outliers)
+    tm = total / n
+    tm_norm = (total_norm / len(normais)) if normais else 0
+    meses = dias / 30.0
+    return (
+        f"**Bling — faturamento atendido · {dias}d ({d1} a {d2})**\n\n"
+        f"**Bruto:** R$ {total:,.2f} · {n} pedidos · ticket médio R$ {tm:,.2f} · mediana R$ {med:,.2f}\n\n"
+        f"**Outliers de valor** (> R$ {limiar:,.2f} = Q3+1.5·IQR):\n"
+        f"- {len(outliers)} pedidos · R$ {total_out:,.2f} "
+        f"({(total_out/total*100 if total else 0):.0f}% do faturamento)\n\n"
+        f"**Sem outliers (fluxo típico):** R$ {total_norm:,.2f} · {len(normais)} pedidos · "
+        f"ticket médio R$ {tm_norm:,.2f}\n"
+        f"- **Média mensal sem outliers (÷{meses:.1f}): R$ {total_norm/meses:,.2f}/mês**\n"
     )
 
 
