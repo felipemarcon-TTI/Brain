@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -2306,6 +2307,45 @@ def publicar_post_ig(legenda: str = "", image_url: str = "", video_url: str = ""
         return f"Erro ao criar container de mídia: {cont}"
     pub = _meta_post(f"{ig}/media_publish", {"creation_id": creation_id})
     return f"✅ Post publicado no Instagram (id {pub.get('id','?')})."
+
+
+@mcp.tool()
+def publicar_story_ig(image_url: str = "", video_url: str = "") -> str:
+    """Publica um STORY no Instagram (@vienna.pet). Informe image_url OU video_url — precisa ser
+    URL PÚBLICA do arquivo. Vídeo de Story: MP4, recomendado vertical 9:16, até ~60s. Requer
+    POSTS_WRITES_ENABLED=true. Para vídeo, aguarda o processamento do Instagram antes de publicar.
+    O Story expira em 24h (comportamento padrão do Instagram)."""
+    _require_write()
+    _posts_assert_writes_enabled()
+    d = _meta_require()
+    ig = d.get("ig_id")
+    if not ig:
+        return "Instagram não vinculado à Página."
+    if not image_url and not video_url:
+        return "Erro: informe image_url ou video_url (URL pública)."
+    container: dict = {"media_type": "STORIES"}
+    if video_url:
+        container["video_url"] = video_url
+    else:
+        container["image_url"] = image_url
+    cont = _meta_post(f"{ig}/media", container)
+    creation_id = cont.get("id")
+    if not creation_id:
+        return f"Erro ao criar container do Story: {cont}"
+    # Vídeo é processado de forma assíncrona — aguarda FINISHED antes de publicar.
+    if video_url:
+        for _ in range(20):  # ~até 60s (20 x 3s)
+            st = _meta_get(str(creation_id), {"fields": "status_code"}).get("status_code", "")
+            if st == "FINISHED":
+                break
+            if st == "ERROR":
+                return f"Erro: o Instagram falhou ao processar o vídeo do Story (container {creation_id})."
+            time.sleep(3)
+        else:
+            return ("O vídeo do Story ainda está sendo processado pelo Instagram. "
+                    f"Tente publicar novamente em instantes (container {creation_id}).")
+    pub = _meta_post(f"{ig}/media_publish", {"creation_id": creation_id})
+    return f"✅ Story publicado no Instagram (id {pub.get('id','?')})."
 
 
 @mcp.tool()
