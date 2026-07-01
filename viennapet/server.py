@@ -1511,7 +1511,8 @@ META_SCOPES = ",".join([
     # Ads (Meta Marketing API) — leitura e gestão de campanhas
     "ads_read", "ads_management",
     # Publicação de conteúdo (post no IG/FB) — exige liberar no painel do App + reautenticar
-    "instagram_content_publish", "pages_manage_posts",
+    # pages_manage_posts removido: inválido/gateado no app atual, quebrava o diálogo de login.
+    "instagram_content_publish",
 ])
 
 # Kill-switch de escrita em Ads (espelha WC_WRITES_ENABLED). Default = desligado para
