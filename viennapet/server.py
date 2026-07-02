@@ -1513,6 +1513,9 @@ META_SCOPES = ",".join([
     # Publicação de conteúdo (post no IG/FB) — exige liberar no painel do App + reautenticar
     # pages_manage_posts removido: inválido/gateado no app atual, quebrava o diálogo de login.
     "instagram_content_publish",
+    # Insights de story/conta (alcance, impressões, respostas) — habilitado no painel do App;
+    # exige reautenticar em /meta/auth para o token novo carregar o escopo.
+    "instagram_manage_insights",
 ])
 
 # Kill-switch de escrita em Ads (espelha WC_WRITES_ENABLED). Default = desligado para
