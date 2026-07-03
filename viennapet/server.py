@@ -1962,14 +1962,31 @@ def instagram_metricas(post_id: str = "", periodo_dias: int = 30) -> str:
         return "Instagram não vinculado à Página."
 
     if post_id:
+        # Story e post/reel suportam métricas diferentes: story NÃO aceita saved/likes/comments
+        # (Media Insights API #100). Detecta o tipo e pede o conjunto certo, com fallback.
         try:
-            ins = _meta_get(f"{post_id}/insights", {"metric": "reach,saved,likes,comments,shares,total_interactions"})
-            vals = {m["name"]: (m.get("values", [{}])[0].get("value") if m.get("values") else m.get("total_value", {}).get("value"))
-                    for m in ins.get("data", [])}
-            return ("**Métricas do post " + post_id + ":**\n" +
-                    "\n".join(f"- {k}: {v}" for k, v in vals.items()))
-        except Exception as e:
-            return f"Erro ao buscar métricas do post: {e}"
+            info_m = _meta_get(post_id, {"fields": "media_product_type,media_type"})
+            mpt = (info_m.get("media_product_type") or "").upper()
+        except Exception:
+            mpt = ""
+        if mpt == "STORY":
+            label = "story"
+            metric_sets = ["reach,replies,taps_forward,taps_back,exits", "reach,replies", "reach"]
+        else:
+            label = "post"
+            metric_sets = ["reach,saved,likes,comments,shares,total_interactions", "reach,total_interactions", "reach"]
+        last_err = None
+        for ms in metric_sets:
+            try:
+                ins = _meta_get(f"{post_id}/insights", {"metric": ms})
+                vals = {m["name"]: (m.get("values", [{}])[0].get("value") if m.get("values") else m.get("total_value", {}).get("value"))
+                        for m in ins.get("data", [])}
+                if vals:
+                    return (f"**Métricas do {label} {post_id}:**\n" +
+                            "\n".join(f"- {k}: {v}" for k, v in vals.items()))
+            except Exception as e:
+                last_err = e
+        return f"Erro ao buscar métricas do {label}: {last_err}"
 
     # Conta: seguidores + engajamento agregado dos posts recentes
     info = _meta_get(ig, {"fields": "username,followers_count,media_count"})
