@@ -1,6 +1,7 @@
 import base64
 import contextvars
 import json
+import logging
 import os
 import re
 import secrets
@@ -14,6 +15,16 @@ import requests
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Nível via env LOG_LEVEL (DEBUG/INFO/WARNING/ERROR). Sai em stdout -> Railway logs.
+
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z",
+)
+log = logging.getLogger("viennapet")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -262,7 +273,7 @@ def _persist_refresh_token_to_railway(refresh_token: str) -> bool:
     }.items() if not v]
     if missing or not refresh_token:
         _last_persist_result = f"ignorado - faltam vars: {missing}"
-        print(f"[railway] persist ignorado - faltam vars: {missing}")
+        log.warning("railway persist ignorado - faltam vars: %s", missing)
         return False
     query = "mutation variableUpsert($input: VariableUpsertInput!) { variableUpsert(input: $input) }"
     variables = {"input": {
@@ -280,14 +291,14 @@ def _persist_refresh_token_to_railway(refresh_token: str) -> bool:
         body = resp.json()
         if body.get("errors"):
             _last_persist_result = f"erro GraphQL: {str(body['errors'])[:200]}"
-            print(f"[railway] variableUpsert errors: {body['errors']}")
+            log.error("railway variableUpsert errors: %s", body["errors"])
             return False
         _last_persist_result = "OK"
-        print("[railway] variableUpsert OK - BLING_REFRESH_TOKEN atualizado")
+        log.info("railway variableUpsert OK - BLING_REFRESH_TOKEN atualizado")
         return True
     except Exception as e:
         _last_persist_result = f"exception: {str(e)[:200]}"
-        print(f"[railway] variableUpsert exception: {e}")
+        log.exception("railway variableUpsert falhou")
         return False
 
 def _bling_save_tokens(data: dict) -> None:
@@ -297,7 +308,7 @@ def _bling_save_tokens(data: dict) -> None:
         BLING_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         BLING_TOKEN_FILE.write_text(json.dumps(data))
     except Exception as e:  # disco efêmero/sem permissão: o cache em memória ainda funciona
-        print(f"[bling] aviso: não foi possível persistir tokens em disco: {e}")
+        log.warning("bling: não foi possível persistir tokens em disco: %s", e)
     # Persiste na env var do Railway para sobreviver a restarts (sem volume)
     _persist_refresh_token_to_railway(data.get("refresh_token", ""))
 
@@ -310,7 +321,7 @@ def _bling_load_tokens() -> dict | None:
             _bling_tokens_cache = json.loads(BLING_TOKEN_FILE.read_text())
             return _bling_tokens_cache
         except Exception as e:
-            print(f"[bling] aviso: arquivo de tokens corrompido: {e}")
+            log.warning("bling: arquivo de tokens corrompido: %s", e)
     refresh = os.environ.get("BLING_REFRESH_TOKEN", "")
     if refresh:
         _bling_tokens_cache = {
@@ -335,6 +346,7 @@ def _bling_refresh_token(stale_access: str | None = None) -> str:
             f"{BLING_BASE_URL}/oauth/token",
             headers={"Authorization": _bling_credentials_header(), "Content-Type": "application/x-www-form-urlencoded"},
             data={"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]},
+            timeout=30,
         )
         if not resp.ok:
             raise RuntimeError(
@@ -359,29 +371,29 @@ def _bling_get_token() -> str:
 
 def _bling_get(path: str, params: dict | None = None) -> dict:
     token = _bling_get_token()
-    resp = requests.get(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}"}, params=params or {})
+    resp = requests.get(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}"}, params=params or {}, timeout=30)
     if resp.status_code == 401:
         token = _bling_refresh_token(stale_access=token)
-        resp = requests.get(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}"}, params=params or {})
+        resp = requests.get(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}"}, params=params or {}, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 def _bling_put(path: str, body: dict) -> dict:
     token = _bling_get_token()
-    resp = requests.put(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
+    resp = requests.put(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body, timeout=30)
     if resp.status_code == 401:
         token = _bling_refresh_token(stale_access=token)
-        resp = requests.put(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
+        resp = requests.put(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body, timeout=30)
     if not resp.ok:
         raise RuntimeError(f"Bling API {resp.status_code}: {resp.text}")
     return resp.json() if resp.content else {}
 
 def _bling_post(path: str, body: dict) -> dict:
     token = _bling_get_token()
-    resp = requests.post(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
+    resp = requests.post(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body, timeout=30)
     if resp.status_code == 401:
         token = _bling_refresh_token(stale_access=token)
-        resp = requests.post(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body)
+        resp = requests.post(f"{BLING_BASE_URL}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=body, timeout=30)
     if not resp.ok:
         raise RuntimeError(f"Bling API {resp.status_code}: {resp.text}")
     return resp.json() if resp.content else {}
@@ -1136,13 +1148,14 @@ async def bling_callback_route(request: Request) -> HTMLResponse:
     if state and state in _bling_pending_state:
         del _bling_pending_state[state]
     elif state:
-        print(f"[bling] aviso: state '{state}' não encontrado (provável restart); prosseguindo com o code do Bling")
+        log.warning("bling: state '%s' não encontrado (provável restart); prosseguindo com o code do Bling", state)
 
     def _exchange():
         resp = requests.post(
             f"{BLING_BASE_URL}/oauth/token",
             headers={"Authorization": _bling_credentials_header(), "Content-Type": "application/x-www-form-urlencoded"},
             data={"grant_type": "authorization_code", "code": code, "redirect_uri": BLING_REDIRECT_URI},
+            timeout=30,
         )
         resp.raise_for_status()
         return resp.json()
@@ -1245,11 +1258,11 @@ async def sync_pedido_bling(request: Request) -> JSONResponse:
             return pedido.get("id")
 
         bling_order_id = await anyio.to_thread.run_sync(_run)
-        print(f"[sync_pedido_bling] WC #{wc_order_id} → Bling #{bling_order_id}")
+        log.info("sync_pedido_bling WC #%s -> Bling #%s", wc_order_id, bling_order_id)
         return JSONResponse({"ok": True, "bling_order_id": bling_order_id, "wc_order_id": wc_order_id})
 
     except Exception as e:
-        print(f"[sync_pedido_bling] error: {e}")
+        log.exception("sync_pedido_bling falhou (WC #%s)", wc_order_id)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -1397,11 +1410,11 @@ def consultar_estoque_bling(id_produto: int) -> str:
     # Endpoint correto: /estoques/saldos — URL manual para preservar colchetes literais
     url = f"{BLING_BASE_URL}/estoques/saldos?idsProdutos[]={id_produto}"
     headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(url, headers=headers)
+    resp = requests.get(url, headers=headers, timeout=30)
     if resp.status_code == 401:
         token = _bling_refresh_token()
         headers = {"Authorization": f"Bearer {token}"}
-        resp = requests.get(url, headers=headers)
+        resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
     items = resp.json().get("data", [])
     if not items:
@@ -1549,8 +1562,8 @@ def _railway_upsert_var(name: str, value: str) -> bool:
             json={"query": query, "variables": variables}, timeout=10)
         resp.raise_for_status()
         return not resp.json().get("errors")
-    except Exception as e:
-        print(f"[railway] upsert {name} erro: {e}")
+    except Exception:
+        log.exception("railway upsert %s falhou", name)
         return False
 
 
@@ -2115,8 +2128,8 @@ async def meta_webhook(request: Request):
         import datetime as _dt
         _meta_events.append({"ts": _dt.datetime.now().isoformat(timespec="seconds"), "data": body})
         del _meta_events[:-50]
-    except Exception as e:
-        print(f"[meta webhook] erro: {e}")
+    except Exception:
+        log.exception("meta webhook: erro ao processar evento")
     return JSONResponse({"ok": True})
 
 
@@ -2445,4 +2458,6 @@ async def admin_export(request: Request) -> JSONResponse:
 
 if __name__ == "__main__":
     import uvicorn
+    log.info("ViennaPet MCP subindo | porta=%s wc_writes=%s log_level=%s",
+             _PORT, WC_WRITES_ENABLED, os.environ.get("LOG_LEVEL", "INFO").upper())
     uvicorn.run(_AuthMiddleware(mcp.sse_app()), host="0.0.0.0", port=_PORT)
