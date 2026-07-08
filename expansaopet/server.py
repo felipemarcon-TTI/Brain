@@ -2,6 +2,7 @@ import base64
 import contextvars
 import hashlib
 import json
+import logging
 import os
 import secrets
 import threading
@@ -15,6 +16,16 @@ import requests
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Nível via env LOG_LEVEL (DEBUG/INFO/WARNING/ERROR). Sai em stdout -> Railway logs.
+
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z",
+)
+log = logging.getLogger("expansaopet")
 
 _token_refresh_lock = threading.Lock()
 
@@ -146,7 +157,7 @@ def _persist_refresh_token_to_railway(refresh_token: str) -> bool:
     service_id     = os.environ.get("RAILWAY_SERVICE_ID", "")
     missing = [k for k, v in {"RAILWAY_API_TOKEN": api_token, "RAILWAY_PROJECT_ID": project_id, "RAILWAY_ENVIRONMENT_ID": environment_id, "RAILWAY_SERVICE_ID": service_id}.items() if not v]
     if missing or not refresh_token:
-        print(f"[railway] persist skipped - missing vars: {missing}")
+        log.warning("railway persist ignorado - vars ausentes: %s", missing)
         return False
     query = """
     mutation variableUpsert($input: VariableUpsertInput!) {
@@ -172,12 +183,12 @@ def _persist_refresh_token_to_railway(refresh_token: str) -> bool:
         resp.raise_for_status()
         body = resp.json()
         if body.get("errors"):
-            print(f"[railway] variableUpsert errors: {body['errors']}")
+            log.error("railway variableUpsert errors: %s", body["errors"])
             return False
-        print("[railway] variableUpsert OK - BLING_REFRESH_TOKEN atualizado")
+        log.info("railway variableUpsert OK - BLING_REFRESH_TOKEN atualizado")
         return True
-    except Exception as e:
-        print(f"[railway] variableUpsert exception: {e}")
+    except Exception:
+        log.exception("railway variableUpsert falhou")
         return False
 
 def _bling_save_tokens(data: dict) -> bool:
@@ -208,6 +219,7 @@ def _bling_refresh_token(old_access_token: str = "") -> str:
             f"{BLING_BASE_URL}/oauth/token",
             headers={"Authorization": _bling_credentials_header(), "Content-Type": "application/x-www-form-urlencoded"},
             data={"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]},
+            timeout=30,
         )
         resp.raise_for_status()
         new_tokens = resp.json()
@@ -242,24 +254,30 @@ def _bling_request(method: str, url: str, *, params: dict | None = None, json_bo
     """Chamada única ao Bling com throttle, refresh de token (401) e retry em 429."""
     token     = _bling_get_token()
     refreshed = False
+    _path = url.replace(BLING_BASE_URL, "")
     for attempt in range(_BLING_MAX_RETRIES):
         _bling_throttle()
         headers = {"Authorization": f"Bearer {token}"}
         if json_body is not None:
             headers["Content-Type"] = "application/json"
+        log.debug("bling %s %s (tentativa %d)", method, _path, attempt + 1)
         resp = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=30)
         if resp.status_code == 401 and not refreshed:
+            log.warning("bling 401 em %s %s - renovando token", method, _path)
             token = _bling_refresh_token(old_access_token=token)
             refreshed = True
             continue
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
             wait = float(retry_after) if retry_after else (1.0 + attempt)
+            log.warning("bling 429 em %s %s - aguardando %.1fs", method, _path, min(wait, 5.0))
             time.sleep(min(wait, 5.0))
             continue
         if not resp.ok:
+            log.error("bling %s %s -> HTTP %s: %s", method, _path, resp.status_code, resp.text[:300])
             raise RuntimeError(f"Bling API {resp.status_code}: {resp.text[:300]}")
         return resp.json() if resp.content else {}
+    log.error("bling %s %s - 429 excedido após %d tentativas", method, _path, _BLING_MAX_RETRIES)
     raise RuntimeError(f"Bling API: limite de requisições (429) excedido após {_BLING_MAX_RETRIES} tentativas.")
 
 
@@ -409,6 +427,7 @@ async def bling_callback_route(request: Request) -> HTMLResponse:
             f"{BLING_BASE_URL}/oauth/token",
             headers={"Authorization": _bling_credentials_header(), "Content-Type": "application/x-www-form-urlencoded"},
             data={"grant_type": "authorization_code", "code": code, "redirect_uri": BLING_REDIRECT_URI},
+            timeout=30,
         )
         resp.raise_for_status()
         return resp.json()
@@ -1857,8 +1876,8 @@ def _railway_upsert_var(name: str, value: str) -> bool:
             json={"query": query, "variables": variables}, timeout=10)
         resp.raise_for_status()
         return not resp.json().get("errors")
-    except Exception as e:
-        print(f"[railway] upsert {name} erro: {e}")
+    except Exception:
+        log.exception("railway upsert %s falhou", name)
         return False
 
 
@@ -2667,5 +2686,7 @@ if __name__ == "__main__":
             else:
                 await self.http_app(scope, receive, send)
 
+    log.info("ExpansaoPet MCP subindo | porta=%s base_url=%s tools=42 log_level=%s",
+             _PORT, _BASE_URL, os.environ.get("LOG_LEVEL", "INFO").upper())
     combined = _CombinedApp(mcp.streamable_http_app(), mcp.sse_app())
     uvicorn.run(_McpCompatMiddleware(_AuthMiddleware(combined)), host="0.0.0.0", port=_PORT)
