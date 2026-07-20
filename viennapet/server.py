@@ -697,15 +697,23 @@ def buscar_produto_wc(produto_id: int) -> str:
 
 @mcp.tool()
 def atualizar_produto_wc(produto_id: int, nome: str = "", preco: str = "", estoque: int = -1,
-                         descricao_curta: str = "", sku: str = "") -> str:
-    """Atualiza campos de um produto WooCommerce. Deixe em branco os campos que não quer alterar."""
+                         descricao_curta: str = "", sku: str = "", preco_promocional: str = "",
+                         remover_promocao: bool = False) -> str:
+    """Atualiza campos de um produto WooCommerce. Deixe em branco os campos que não quer alterar.
+
+    - preco: preço cheio (regular_price).
+    - preco_promocional: preço promocional (sale_price). Use para colocar o produto em promoção.
+    - remover_promocao: True encerra a promoção (limpa o sale_price).
+    """
     _require_write()
     dados = {}
-    if nome:            dados["name"] = nome
-    if preco:           dados["regular_price"] = preco
-    if estoque >= 0:    dados["stock_quantity"] = estoque
-    if descricao_curta: dados["short_description"] = descricao_curta
-    if sku:             dados["sku"] = sku
+    if nome:              dados["name"] = nome
+    if preco:             dados["regular_price"] = preco
+    if preco_promocional: dados["sale_price"] = preco_promocional
+    if remover_promocao:  dados["sale_price"] = ""
+    if estoque >= 0:      dados["stock_quantity"] = estoque
+    if descricao_curta:   dados["short_description"] = descricao_curta
+    if sku:               dados["sku"] = sku
     if not dados:
         return "Nenhum campo informado para atualizar."
     p = _wc_put(f"products/{produto_id}", dados)
@@ -721,7 +729,8 @@ def listar_variacoes(produto_id: int) -> str:
     linhas = [
         f"- [var#{v['id']}] SKU: {v.get('sku') or 'sem SKU'} | "
         f"{', '.join(a['option'] for a in v.get('attributes', []))} | "
-        f"R$ {v.get('regular_price') or v.get('price') or '-'} | "
+        f"R$ {v.get('regular_price') or v.get('price') or '-'}"
+        f"{(' | promo: R$ ' + v['sale_price']) if v.get('sale_price') else ''} | "
         f"Estoque: {v.get('stock_quantity', '?')}"
         for v in variacoes
     ]
@@ -729,13 +738,21 @@ def listar_variacoes(produto_id: int) -> str:
 
 
 @mcp.tool()
-def atualizar_variacao(produto_id: int, variacao_id: int, sku: str = "", preco: str = "", estoque: int = -1) -> str:
-    """Atualiza SKU, preço e/ou estoque de uma variação específica de um produto variável."""
+def atualizar_variacao(produto_id: int, variacao_id: int, sku: str = "", preco: str = "", estoque: int = -1,
+                       preco_promocional: str = "", remover_promocao: bool = False) -> str:
+    """Atualiza SKU, preço e/ou estoque de uma variação específica de um produto variável.
+
+    - preco: preço cheio (regular_price) da variação.
+    - preco_promocional: preço promocional (sale_price) da variação. Use para colocar em promoção.
+    - remover_promocao: True encerra a promoção da variação (limpa o sale_price).
+    """
     _require_write()
     dados = {}
-    if sku:          dados["sku"] = sku
-    if preco:        dados["regular_price"] = preco
-    if estoque >= 0: dados["stock_quantity"] = estoque
+    if sku:               dados["sku"] = sku
+    if preco:             dados["regular_price"] = preco
+    if preco_promocional: dados["sale_price"] = preco_promocional
+    if remover_promocao:  dados["sale_price"] = ""
+    if estoque >= 0:      dados["stock_quantity"] = estoque
     if not dados:
         return "Nenhum campo informado para atualizar."
     v = _wc_put(f"products/{produto_id}/variations/{variacao_id}", dados)
