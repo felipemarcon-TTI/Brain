@@ -501,8 +501,20 @@ def criar_cupom(codigo: str, data_validade: str, desconto_percentual: float, don
 @mcp.tool()
 def criar_cupom_simples(codigo: str, desconto_percentual: float, frete_gratis: bool = True,
                         uso_unico: bool = True, data_validade: str = "") -> str:
-    """Cria um cupom de desconto simples no WooCommerce, SEM registrar na planilha de
-    afiliados (para testes/promoções pontuais).
+    """Cria um cupom de desconto simples (percentual) no WooCommerce, SEM registrar afiliado
+    (para promoções pontuais/testes).
+
+    ⚠️ ANTES DE CRIAR, o assistente DEVE perguntar e CONFIRMAR com o usuário TODOS estes itens
+    — não assuma nenhum valor por conta própria, para o usuário não esquecer de nada:
+      1. codigo — qual será o código do cupom (ex.: INVERNO20).
+      2. desconto_percentual — qual a % de desconto (ex.: 20).
+      3. frete_gratis — PERGUNTE EXPLICITAMENTE se o cupom deve dar frete grátis (sim ou não).
+         Este é o item que mais passa batido; confirme sempre, não deixe no padrão silenciosamente.
+      4. uso_unico — se o cupom pode ser usado só 1 vez ou várias vezes.
+      5. data_validade — se tem data de expiração (AAAA-MM-DD) ou se fica sem validade.
+    Só chame esta ferramenta depois de ter esses 5 itens confirmados pelo usuário.
+
+    Parâmetros:
     - desconto_percentual: % de desconto (ex.: 50 para 50%)
     - frete_gratis: se True, marca free_shipping no cupom (o checkout do site novo zera o
       frete quando o cupom tem free_shipping=true)
