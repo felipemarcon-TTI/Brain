@@ -698,19 +698,25 @@ def buscar_produto_wc(produto_id: int) -> str:
 @mcp.tool()
 def atualizar_produto_wc(produto_id: int, nome: str = "", preco: str = "", estoque: int = -1,
                          descricao_curta: str = "", sku: str = "", preco_promocional: str = "",
-                         remover_promocao: bool = False) -> str:
+                         remover_promocao: bool = False, data_fim_promocao: str = "") -> str:
     """Atualiza campos de um produto WooCommerce. Deixe em branco os campos que não quer alterar.
 
     - preco: preço cheio (regular_price).
     - preco_promocional: preço promocional (sale_price). Use para colocar o produto em promoção.
-    - remover_promocao: True encerra a promoção (limpa o sale_price).
+    - data_fim_promocao: data de término da promoção no formato 'YYYY-MM-DD' (date_on_sale_to).
+      A promoção expira sozinha no fim desse dia (fuso do site). Ex.: '2026-07-31'.
+    - remover_promocao: True encerra a promoção agora (limpa o sale_price e as datas).
     """
     _require_write()
     dados = {}
     if nome:              dados["name"] = nome
     if preco:             dados["regular_price"] = preco
     if preco_promocional: dados["sale_price"] = preco_promocional
-    if remover_promocao:  dados["sale_price"] = ""
+    if data_fim_promocao: dados["date_on_sale_to"] = data_fim_promocao
+    if remover_promocao:
+        dados["sale_price"] = ""
+        dados["date_on_sale_from"] = ""
+        dados["date_on_sale_to"] = ""
     if estoque >= 0:      dados["stock_quantity"] = estoque
     if descricao_curta:   dados["short_description"] = descricao_curta
     if sku:               dados["sku"] = sku
@@ -739,19 +745,25 @@ def listar_variacoes(produto_id: int) -> str:
 
 @mcp.tool()
 def atualizar_variacao(produto_id: int, variacao_id: int, sku: str = "", preco: str = "", estoque: int = -1,
-                       preco_promocional: str = "", remover_promocao: bool = False) -> str:
+                       preco_promocional: str = "", remover_promocao: bool = False, data_fim_promocao: str = "") -> str:
     """Atualiza SKU, preço e/ou estoque de uma variação específica de um produto variável.
 
     - preco: preço cheio (regular_price) da variação.
     - preco_promocional: preço promocional (sale_price) da variação. Use para colocar em promoção.
-    - remover_promocao: True encerra a promoção da variação (limpa o sale_price).
+    - data_fim_promocao: data de término da promoção 'YYYY-MM-DD' (date_on_sale_to). A promoção
+      expira sozinha no fim desse dia (fuso do site). Ex.: '2026-07-31'.
+    - remover_promocao: True encerra a promoção da variação agora (limpa o sale_price e as datas).
     """
     _require_write()
     dados = {}
     if sku:               dados["sku"] = sku
     if preco:             dados["regular_price"] = preco
     if preco_promocional: dados["sale_price"] = preco_promocional
-    if remover_promocao:  dados["sale_price"] = ""
+    if data_fim_promocao: dados["date_on_sale_to"] = data_fim_promocao
+    if remover_promocao:
+        dados["sale_price"] = ""
+        dados["date_on_sale_from"] = ""
+        dados["date_on_sale_to"] = ""
     if estoque >= 0:      dados["stock_quantity"] = estoque
     if not dados:
         return "Nenhum campo informado para atualizar."
