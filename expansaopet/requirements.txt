@@ -1,5 +1,6 @@
-mcp>=1.2.0
-requests>=2.31.0
-anyio>=4.0.0
-uvicorn>=0.30.0
-starlette>=0.40.0
+# mcp 2.0 removeu mcp.server.fastmcp — manter travado na major 1.
+mcp>=1.2.0,<2
+requests>=2.31.0,<3
+anyio>=4.0.0,<5
+uvicorn>=0.30.0,<1
+starlette>=0.40.0,<1
